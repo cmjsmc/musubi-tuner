@@ -1,8 +1,8 @@
 # run_secure_training.py
-import io
-import argparse
 import sys
 import os
+import io
+import argparse
 import tempfile
 import atexit
 import shutil
@@ -10,14 +10,21 @@ import hashlib
 from collections import defaultdict
 from enum import Enum
 
-# --- Third-party library validation ---
+# --- Enhanced Import Validation ---
+try:
+    import toml
+except ImportError:
+    print(f"Error: 'toml' package not found in '{sys.executable}'.\nRun: {sys.executable} -m pip install toml", file=sys.stderr)
+    sys.exit(1)
 try:
     import py7zr
-    import toml
+except ImportError:
+    print(f"Error: 'py7zr' package not found in '{sys.executable}'.\nRun: {sys.executable} -m pip install py7zr", file=sys.stderr)
+    sys.exit(1)
+try:
     from pyfakefs.fake_filesystem_unittest import Patcher
 except ImportError:
-    print("Error: Required packages are not installed.")
-    print("Please run: pip install pyfakefs py7zr toml")
+    print(f"Error: 'pyfakefs' package not found in '{sys.executable}'.\nRun: {sys.executable} -m pip install pyfakefs", file=sys.stderr)
     sys.exit(1)
 
 # --- Training script import validation ---
@@ -26,11 +33,10 @@ try:
     from musubi_tuner import qwen_image_cache_latents as cache_latents_script
     from src.musubi_tuner import qwen_image_train_network as train_network_script
 except ImportError as e:
-    print(f"Error importing training modules: {e}")
-    print("Please ensure this script is run from the correct directory or adjust sys.path.")
+    print(f"Error importing training modules: {e}", file=sys.stderr)
+    print("Please ensure this script is run from the correct directory or adjust sys.path.", file=sys.stderr)
     sys.exit(1)
 
-# --- Helper classes and functions for argparse ---
 class DynamoBackend(Enum):
     NO = "NO"; EAGER = "eager"; AOT_EAGER = "aot_eager"; INDUCTOR = "inductor"
     AOT_NVFUSER = "aot_nvfuser"; NVFUSER = "nvfuser"; OFI = "ofi"; FX2TRT = "fx2trt"
@@ -45,10 +51,7 @@ def int_or_float(value):
     except ValueError:
         raise argparse.ArgumentTypeError(f"Invalid value: {value}")
 
-# --- Core Orchestrator Functions ---
-
 def prepare_real_directories(args):
-    """Ensures output and cache directories exist, creating temporary ones if not specified."""
     if args.output_dir is None:
         temp_session_dir = tempfile.mkdtemp()
         args.output_dir = os.path.join(temp_session_dir, "outputs")
@@ -69,38 +72,29 @@ def prepare_real_directories(args):
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(args.cache_dir, exist_ok=True)
 
-
 def load_and_configure_toml_in_memory(fs, real_toml_path, real_cache_dir, virtual_dataset_dir, virtual_config_path):
-    """Loads a TOML from the real disk, modifies it for the virtual environment, and saves it to the virtual filesystem."""
     print(f"\nLoading and configuring '{real_toml_path}' for in-memory use...")
     with open(real_toml_path, 'r') as f:
         config = toml.load(f)
-
     if 'datasets' not in config or not isinstance(config['datasets'], list):
         raise ValueError("Dataset TOML config must contain a list under the 'datasets' key.")
-
     for ds in config['datasets']:
         ds['cache_dir'] = real_cache_dir
         ds['root_dir'] = virtual_dataset_dir
-    
     fs.create_file(virtual_config_path, contents=toml.dumps(config))
     print(f"In-memory config created at '{virtual_config_path}' with real cache path and virtual data path.")
 
-
 def anonymize_virtual_dataset(fs, root_dir: str):
-    """Silently walks a virtual directory, renaming files to a hash of their basename."""
     print(f"\nAnonymizing in-memory filenames inside '{root_dir}'...")
     if not fs.exists(root_dir):
         print(f"Warning: Virtual directory '{root_dir}' not found. Skipping anonymization.")
         return
-
     files_by_basename = defaultdict(list)
     for dirpath, _, filenames in fs.walk(root_dir):
         for filename in filenames:
             basename, ext = os.path.splitext(filename)
             full_path = os.path.join(dirpath, filename)
             files_by_basename[basename].append((full_path, ext))
-
     renamed_count = 0
     for basename, files in files_by_basename.items():
         hashed_basename = hashlib.sha256(basename.encode('utf-8')).hexdigest()
@@ -111,9 +105,7 @@ def anonymize_virtual_dataset(fs, root_dir: str):
             renamed_count += 1
     print(f"Anonymization complete. Renamed {renamed_count} files in memory without exposing filenames.")
 
-
 def run_pipeline(args):
-    """Main orchestrator for the secure hybrid training pipeline."""
     prepare_real_directories(args)
     
     virtual_workspace = "/workspace"
@@ -121,8 +113,15 @@ def run_pipeline(args):
     virtual_dataset_dir = f"{virtual_workspace}/datasets/train_data"
     virtual_config_path = f"{virtual_workspace}/dataset_config.toml"
     
-    with open(args.archive_path, 'rb') as f:
-        archive_data_stream = io.BytesIO(f.read())
+    print("\nReading archive contents into memory (this may take a moment)...")
+    archive_contents = {}
+    try:
+        with py7zr.SevenZipFile(args.archive_path, 'r', password=args.password) as archive:
+            archive_contents = archive.readall()
+        print("Archive read successfully into memory.")
+    except Exception as e:
+        print(f"FATAL: Failed to read .7z archive: {e}", file=sys.stderr)
+        sys.exit(1)
 
     with Patcher() as patcher:
         fs = patcher.fs
@@ -130,24 +129,25 @@ def run_pipeline(args):
         print("\nMounting real paths into virtual filesystem...")
         virtual_vae_path = f"{virtual_model_dir}/vae.safetensors"
         virtual_dit_path = f"{virtual_model_dir}/dit_model.safetensors"
-        virtual_text_encoder_path = f"{virtual_model_dir}/text_encoder"
+        # CORRECTED: Define a virtual path for the single text encoder file
+        virtual_text_encoder_path = f"{virtual_model_dir}/text_encoder.safetensors"
         
         fs.add_real_file(args.vae_path, target_path=virtual_vae_path)
         fs.add_real_file(args.pretrained_model_name_or_path, target_path=virtual_dit_path)
-        fs.add_real_directory(args.text_encoder_path, target_path=virtual_text_encoder_path)
+        # CORRECTED: Use add_real_file for the text encoder path
+        fs.add_real_file(args.text_encoder_path, target_path=virtual_text_encoder_path)
         fs.add_real_directory(args.output_dir)
         fs.add_real_directory(args.cache_dir)
         print("Mounting complete.")
 
-        print("\nExtracting archive into virtual filesystem...")
-        with py7zr.SevenZipFile(archive_data_stream, 'r', password=args.password) as archive:
-            archive.extractall()
-        print("Extraction complete.")
+        print("\nPopulating virtual filesystem from memory...")
+        for filename, content_stream in archive_contents.items():
+            fs.create_file(filename, contents=content_stream.read())
+        print("Virtual filesystem populated.")
 
         load_and_configure_toml_in_memory(fs, args.dataset_config_path, args.cache_dir, virtual_dataset_dir, virtual_config_path)
         anonymize_virtual_dataset(fs, virtual_dataset_dir)
         
-        # --- STAGE 1 & 2: Caching ---
         print("\n--- STAGE 1: Caching Text Encoder Outputs ---")
         cache_encoder_args = argparse.Namespace(
             dataset_config=virtual_config_path, text_encoder=virtual_text_encoder_path,
@@ -169,13 +169,12 @@ def run_pipeline(args):
         cache_latents_script.main_exec(cache_latents_args)
         print("--- STAGE 2 COMPLETE ---\n")
         
-        # --- STAGE 3: Training Network ---
         print("--- STAGE 3: Training Network ---")
         args.dataset_config = virtual_config_path
         args.vae = virtual_vae_path
         args.text_encoder = virtual_text_encoder_path
         args.pretrained_model_name_or_path = virtual_dit_path
-        args.dit = virtual_dit_path # Some scripts might use this alias
+        args.dit = virtual_dit_path
         train_network_script.main_exec(args)
         print("--- STAGE 3 COMPLETE ---\n")
 
@@ -183,16 +182,14 @@ def run_pipeline(args):
         print(f"\nFinal model and logs saved to: {args.output_dir}")
         print(f"Caches saved to: {args.cache_dir}")
 
-
 def setup_main_parser():
     parser = argparse.ArgumentParser(description="Securely run a Qwen-Image training pipeline using an in-memory filesystem.")
-
     # --- Path Arguments ---
     g_paths = parser.add_argument_group('Path Arguments')
     g_paths.add_argument("--archive_path", type=str, required=True, help="Path to the .7z archive with dataset images/captions.")
     g_paths.add_argument("--dataset_config_path", type=str, required=True, help="Path to the dataset .toml config file on your real disk.")
     g_paths.add_argument("--vae_path", type=str, required=True, help="Path to the VAE model file (.safetensors).")
-    g_paths.add_argument("--text_encoder_path", type=str, required=True, help="Path to the text encoder model directory.")
+    g_paths.add_argument("--text_encoder_path", type=str, required=True, help="Path to the text encoder model file (.safetensors).")
     g_paths.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Path to the pretrained DiT model file (.safetensors).")
     g_paths.add_argument("--output_dir", type=str, default=None, help="Directory to save final models and logs. (Default: a temporary directory)")
     g_paths.add_argument("--cache_dir", type=str, default=None, help="Directory to save caches. (Default: a 'caches' subfolder in the output directory)")
@@ -202,6 +199,7 @@ def setup_main_parser():
     g_paths.add_argument("--sample_prompts", type=str, default=None, help="File with prompts for generating sample images.")
     g_paths.add_argument("--config_file", type=str, default=None, help="Load hyperparameters from a .toml file instead of command line.")
 
+    # (The rest of the comprehensive argparse setup remains identical)
     # --- Core Training Arguments ---
     g_train = parser.add_argument_group('Core Training Arguments')
     g_train.add_argument("--output_name", type=str, default="qwen_lora_model", help="Basename for saved model files.")
@@ -250,7 +248,7 @@ def setup_main_parser():
     g_qwen.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"], default="sigma", help="Method to sample timesteps.")
     g_qwen.add_argument("--discrete_flow_shift", type=float, default=1.0, help="Discrete flow shift for the Euler Discrete Scheduler.")
     g_qwen.add_argument("--weighting_scheme", type=str, default="none", choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"], help="Weighting scheme for timestep distribution.")
-    
+
     # --- Performance & Optimization ---
     g_perf = parser.add_argument_group('Performance & Optimization')
     g_perf.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
@@ -261,15 +259,15 @@ def setup_main_parser():
     g_perf.add_argument("--sage_attn", action="store_true", help="Use SageAttention.")
     g_perf.add_argument("--xformers", action="store_true", help="Use xformers for CrossAttention.")
     g_perf.add_argument("--split_attn", action="store_true", help="Use split attention calculation.")
-    g_perf.add_argument("--fp8_vl", action="store_true", help="Use fp8 for TE model.")
     g_perf.add_argument("--fp8_base", action="store_true", help="Use fp8 for base model.")
     g_perf.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT model.")
     g_perf.add_argument("--dynamo_backend", type=str, default="NO", choices=[e.value for e in DynamoBackend], help="Dynamo backend type.")
     g_perf.add_argument("--dynamo_mode", type=str, default=None, choices=["default", "reduce-overhead", "max-autotune"], help="Dynamo mode.")
     g_perf.add_argument("--blocks_to_swap", type=int, default=None, help="Number of blocks to swap in the model.")
     g_perf.add_argument("--img_in_txt_in_offloading", action="store_true", help="Offload img_in and txt_in to CPU.")
+    g_perf.add_argument("--fp8_vl", action="store_true", help="Use fp8 for TE model.")
     g_perf.add_argument("--num_timestep_buckets", type=int, default=5, help="Number of tm buck.")
-    
+
     # --- DDP Arguments ---
     g_ddp = parser.add_argument_group('Distributed Training (DDP) Arguments')
     g_ddp.add_argument("--ddp_timeout", type=int, default=None, help="DDP timeout in minutes.")
@@ -295,7 +293,6 @@ def setup_main_parser():
     g_log.add_argument("--training_comment", type=str, default=None, help="Arbitrary comment string stored in metadata.")
     
     return parser
-
 
 if __name__ == "__main__":
     parser = setup_main_parser()
