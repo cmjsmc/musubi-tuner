@@ -14,7 +14,7 @@ from enum import Enum
 try:
     import py7zr
     import toml
-    from pyfakefs.fake_filesystem_patcher import Patcher
+    from pyfakefs.fake_filesystem_unittest import Patcher
 except ImportError:
     print("Error: Required packages are not installed.")
     print("Please run: pip install pyfakefs py7zr toml")
