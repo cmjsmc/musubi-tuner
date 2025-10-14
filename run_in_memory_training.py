@@ -1,8 +1,8 @@
 # run_secure_training.py
-import io
-import argparse
 import sys
 import os
+import io
+import argparse
 import tempfile
 import atexit
 import shutil
@@ -10,14 +10,16 @@ import hashlib
 from collections import defaultdict
 from enum import Enum
 
-# --- Third-party library validation ---
+
 try:
-    import py7zr
     import toml
+    import libarchive.public
     from pyfakefs.fake_filesystem_unittest import Patcher
 except ImportError:
-    print("Error: Required packages are not installed.")
-    print("Please run: pip install pyfakefs py7zr toml")
+    print("--- Missing Prerequisite: 'pyfakefs' package ---", file=sys.stderr)
+    print(f"The Python interpreter at '{sys.executable}' cannot find the 'pyfakefs' package.", file=sys.stderr)
+    print("\nTo fix this, please run the following command in your terminal:", file=sys.stderr)
+    print(f"   {sys.executable} -m pip install pyfakefs\n", file=sys.stderr)
     sys.exit(1)
 
 # --- Training script import validation ---
@@ -26,8 +28,8 @@ try:
     from musubi_tuner import qwen_image_cache_latents as cache_latents_script
     from src.musubi_tuner import qwen_image_train_network as train_network_script
 except ImportError as e:
-    print(f"Error importing training modules: {e}")
-    print("Please ensure this script is run from the correct directory or adjust sys.path.")
+    print(f"Error importing training modules: {e}", file=sys.stderr)
+    print("Please ensure this script is run from the correct directory or adjust sys.path.", file=sys.stderr)
     sys.exit(1)
 
 # --- Helper classes and functions for argparse ---
@@ -122,7 +124,7 @@ def run_pipeline(args):
     virtual_config_path = f"{virtual_workspace}/dataset_config.toml"
     
     with open(args.archive_path, 'rb') as f:
-        archive_data_stream = io.BytesIO(f.read())
+        archive_data_bytes = f.read()
 
     with Patcher() as patcher:
         fs = patcher.fs
@@ -139,15 +141,29 @@ def run_pipeline(args):
         fs.add_real_directory(args.cache_dir)
         print("Mounting complete.")
 
-        print("\nExtracting archive into virtual filesystem...")
-        with py7zr.SevenZipFile(archive_data_stream, 'r', password=args.password) as archive:
-            archive.extractall(path="/")
-        print("Extraction complete.")
+        print("\nExtracting archive into virtual filesystem using libarchive...")
+        try:
+            with libarchive.public.memory_reader(archive_data_bytes, password=args.password) as archive:
+                for entry in archive:
+                    virtual_path = os.path.join("/", entry.pathname)
+                    if entry.isdir:
+                        fs.create_dir(virtual_path)
+                    else:
+                        parent_dir = os.path.dirname(virtual_path)
+                        if not fs.exists(parent_dir):
+                            fs.create_dir(parent_dir, recursive=True)
+                        with open(virtual_path, 'wb') as f:
+                            for block in entry.get_blocks():
+                                f.write(block)
+            print("Extraction complete.")
+        except libarchive.ArchiveError as e:
+            print(f"FATAL: Failed to read archive with libarchive: {e}", file=sys.stderr)
+            print("This may be due to a wrong password or a corrupted archive file.", file=sys.stderr)
+            sys.exit(1)
 
         load_and_configure_toml_in_memory(fs, args.dataset_config_path, args.cache_dir, virtual_dataset_dir, virtual_config_path)
         anonymize_virtual_dataset(fs, virtual_dataset_dir)
         
-        # --- STAGE 1 & 2: Caching ---
         print("\n--- STAGE 1: Caching Text Encoder Outputs ---")
         cache_encoder_args = argparse.Namespace(
             dataset_config=virtual_config_path, text_encoder=virtual_text_encoder_path,
@@ -169,13 +185,12 @@ def run_pipeline(args):
         cache_latents_script.main_exec(cache_latents_args)
         print("--- STAGE 2 COMPLETE ---\n")
         
-        # --- STAGE 3: Training Network ---
         print("--- STAGE 3: Training Network ---")
         args.dataset_config = virtual_config_path
         args.vae = virtual_vae_path
         args.text_encoder = virtual_text_encoder_path
         args.pretrained_model_name_or_path = virtual_dit_path
-        args.dit = virtual_dit_path # Some scripts might use this alias
+        args.dit = virtual_dit_path
         train_network_script.main_exec(args)
         print("--- STAGE 3 COMPLETE ---\n")
 
@@ -186,8 +201,7 @@ def run_pipeline(args):
 
 def setup_main_parser():
     parser = argparse.ArgumentParser(description="Securely run a Qwen-Image training pipeline using an in-memory filesystem.")
-
-    # --- Path Arguments ---
+    
     g_paths = parser.add_argument_group('Path Arguments')
     g_paths.add_argument("--archive_path", type=str, required=True, help="Path to the .7z archive with dataset images/captions.")
     g_paths.add_argument("--dataset_config_path", type=str, required=True, help="Path to the dataset .toml config file on your real disk.")
@@ -202,7 +216,6 @@ def setup_main_parser():
     g_paths.add_argument("--sample_prompts", type=str, default=None, help="File with prompts for generating sample images.")
     g_paths.add_argument("--config_file", type=str, default=None, help="Load hyperparameters from a .toml file instead of command line.")
 
-    # --- Core Training Arguments ---
     g_train = parser.add_argument_group('Core Training Arguments')
     g_train.add_argument("--output_name", type=str, default="qwen_lora_model", help="Basename for saved model files.")
     g_train.add_argument("--max_train_steps", type=int, default=1600, help="Total number of training steps.")
@@ -215,7 +228,6 @@ def setup_main_parser():
     g_train.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
     g_train.add_argument("--vae_dtype", type=str, default="bfloat16", help="Data type for VAE (e.g., float16, bfloat16).")
     
-    # --- Network Configuration ---
     g_net = parser.add_argument_group('Network Configuration')
     g_net.add_argument("--network_module", type=str, required=True, help="Network module to use (e.g., 'networks.lora').")
     g_net.add_argument("--network_dim", type=int, default=128, help="Dimension of the network (rank for LoRA).")
@@ -226,7 +238,6 @@ def setup_main_parser():
     g_net.add_argument("--scale_weight_norms", type=float, default=None, help="Scale the weight of each key pair to help prevent overtraining.")
     g_net.add_argument("--base_weights_multiplier", type=float, default=None, nargs="*", help="Multiplier for base_weights.")
 
-    # --- Optimizer and LR Scheduler ---
     g_opt = parser.add_argument_group('Optimizer and LR Scheduler')
     g_opt.add_argument("--optimizer_type", type=str, default="AdamW8bit", help="Optimizer to use.")
     g_opt.add_argument("--optimizer_args", type=str, default=None, nargs="*", help="Additional arguments for the optimizer.")
@@ -242,7 +253,6 @@ def setup_main_parser():
     g_opt.add_argument("--lr_scheduler_type", type=str, default="", help="Custom scheduler module.")
     g_opt.add_argument("--lr_scheduler_args", type=str, default=None, nargs="*", help="Additional arguments for scheduler.")
 
-    # --- Qwen-Image & Timestep Arguments ---
     g_qwen = parser.add_argument_group('Qwen-Image & Timestep Arguments')
     g_qwen.add_argument("--edit", action="store_true", default=True, help="Enable training for Qwen-Image-Edit.")
     g_qwen.add_argument("--edit_plus", action="store_true", help="Enable training for Qwen-Image-Edit-2509.")
@@ -250,8 +260,7 @@ def setup_main_parser():
     g_qwen.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"], default="sigma", help="Method to sample timesteps.")
     g_qwen.add_argument("--discrete_flow_shift", type=float, default=1.0, help="Discrete flow shift for the Euler Discrete Scheduler.")
     g_qwen.add_argument("--weighting_scheme", type=str, default="none", choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"], help="Weighting scheme for timestep distribution.")
-    
-    # --- Performance & Optimization ---
+
     g_perf = parser.add_argument_group('Performance & Optimization')
     g_perf.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
     g_perf.add_argument("--gradient_checkpointing_cpu_offload", action="store_true", help="Enable CPU offloading of activation for gradient checkpointing.")
@@ -261,22 +270,20 @@ def setup_main_parser():
     g_perf.add_argument("--sage_attn", action="store_true", help="Use SageAttention.")
     g_perf.add_argument("--xformers", action="store_true", help="Use xformers for CrossAttention.")
     g_perf.add_argument("--split_attn", action="store_true", help="Use split attention calculation.")
-    g_perf.add_argument("--fp8_vl", action="store_true", help="Use fp8 for TE model.")
     g_perf.add_argument("--fp8_base", action="store_true", help="Use fp8 for base model.")
     g_perf.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT model.")
     g_perf.add_argument("--dynamo_backend", type=str, default="NO", choices=[e.value for e in DynamoBackend], help="Dynamo backend type.")
     g_perf.add_argument("--dynamo_mode", type=str, default=None, choices=["default", "reduce-overhead", "max-autotune"], help="Dynamo mode.")
     g_perf.add_argument("--blocks_to_swap", type=int, default=None, help="Number of blocks to swap in the model.")
     g_perf.add_argument("--img_in_txt_in_offloading", action="store_true", help="Offload img_in and txt_in to CPU.")
+    g_perf.add_argument("--fp8_vl", action="store_true", help="Use fp8 for TE model.")
     g_perf.add_argument("--num_timestep_buckets", type=int, default=5, help="Number of tm buck.")
-    
-    # --- DDP Arguments ---
+
     g_ddp = parser.add_argument_group('Distributed Training (DDP) Arguments')
     g_ddp.add_argument("--ddp_timeout", type=int, default=None, help="DDP timeout in minutes.")
     g_ddp.add_argument("--ddp_gradient_as_bucket_view", action="store_true", help="Enable gradient_as_bucket_view for DDP.")
     g_ddp.add_argument("--ddp_static_graph", action="store_true", help="Enable static_graph for DDP.")
 
-    # --- Logging, Saving & Metadata ---
     g_log = parser.add_argument_group('Logging, Saving & Metadata')
     g_log.add_argument("--logging_dir", type=str, default=None, help="Enable logging and output TensorBoard log to this directory.")
     g_log.add_argument("--log_with", type=str, default=None, choices=["tensorboard", "wandb", "all"], help="Logging tool to use.")
