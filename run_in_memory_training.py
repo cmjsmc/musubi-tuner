@@ -13,7 +13,7 @@ from enum import Enum
 
 try:
     import toml
-    import libarchive.public
+    import libarchive
     from pyfakefs.fake_filesystem_unittest import Patcher
 except ImportError:
     print("--- Missing Prerequisite: 'pyfakefs' package ---", file=sys.stderr)
@@ -143,7 +143,7 @@ def run_pipeline(args):
 
         print("\nExtracting archive into virtual filesystem using libarchive...")
         try:
-            with libarchive.public.memory_reader(archive_data_bytes, password=args.password) as archive:
+            with libarchive.memory_reader(archive_data_bytes, password=args.password) as archive:
                 for entry in archive:
                     virtual_path = os.path.join("/", entry.pathname)
                     if entry.isdir:
