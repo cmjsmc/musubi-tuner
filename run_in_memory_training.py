@@ -143,7 +143,7 @@ def run_pipeline(args):
 
         print("\nExtracting archive into virtual filesystem using libarchive...")
         try:
-            with libarchive.memory_reader(archive_data_bytes, password=args.password) as archive:
+            with libarchive.memory_reader(archive_data_bytes, passphrase=args.password) as archive:
                 for entry in archive:
                     virtual_path = os.path.join("/", entry.pathname)
                     if entry.isdir:
