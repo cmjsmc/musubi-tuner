@@ -250,7 +250,6 @@ def setup_main_parser():
     g_qwen.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"], default="sigma", help="Method to sample timesteps.")
     g_qwen.add_argument("--discrete_flow_shift", type=float, default=1.0, help="Discrete flow shift for the Euler Discrete Scheduler.")
     g_qwen.add_argument("--weighting_scheme", type=str, default="none", choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"], help="Weighting scheme for timestep distribution.")
-    g_perf.add_argument("--num_timestep_buckets", type=int, default=5, help="Number of tm buck.")
     
     # --- Performance & Optimization ---
     g_perf = parser.add_argument_group('Performance & Optimization')
@@ -269,7 +268,8 @@ def setup_main_parser():
     g_perf.add_argument("--dynamo_mode", type=str, default=None, choices=["default", "reduce-overhead", "max-autotune"], help="Dynamo mode.")
     g_perf.add_argument("--blocks_to_swap", type=int, default=None, help="Number of blocks to swap in the model.")
     g_perf.add_argument("--img_in_txt_in_offloading", action="store_true", help="Offload img_in and txt_in to CPU.")
-
+    g_perf.add_argument("--num_timestep_buckets", type=int, default=5, help="Number of tm buck.")
+    
     # --- DDP Arguments ---
     g_ddp = parser.add_argument_group('Distributed Training (DDP) Arguments')
     g_ddp.add_argument("--ddp_timeout", type=int, default=None, help="DDP timeout in minutes.")
