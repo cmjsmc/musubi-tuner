@@ -250,7 +250,8 @@ def setup_main_parser():
     g_qwen.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"], default="sigma", help="Method to sample timesteps.")
     g_qwen.add_argument("--discrete_flow_shift", type=float, default=1.0, help="Discrete flow shift for the Euler Discrete Scheduler.")
     g_qwen.add_argument("--weighting_scheme", type=str, default="none", choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"], help="Weighting scheme for timestep distribution.")
-
+    g_perf.add_argument("--num_timestep_buckets", type=int, default=5, help="Number of tm buck.")
+    
     # --- Performance & Optimization ---
     g_perf = parser.add_argument_group('Performance & Optimization')
     g_perf.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
@@ -261,6 +262,7 @@ def setup_main_parser():
     g_perf.add_argument("--sage_attn", action="store_true", help="Use SageAttention.")
     g_perf.add_argument("--xformers", action="store_true", help="Use xformers for CrossAttention.")
     g_perf.add_argument("--split_attn", action="store_true", help="Use split attention calculation.")
+    g_perf.add_argument("--fp8_vl", action="store_true", help="Use fp8 for TE model.")
     g_perf.add_argument("--fp8_base", action="store_true", help="Use fp8 for base model.")
     g_perf.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT model.")
     g_perf.add_argument("--dynamo_backend", type=str, default="NO", choices=[e.value for e in DynamoBackend], help="Dynamo backend type.")
