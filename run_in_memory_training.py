@@ -1,4 +1,4 @@
-# run_secure_hybrid_training.py
+# run_secure_training.py
 import io
 import argparse
 import sys
@@ -8,17 +8,19 @@ import atexit
 import shutil
 import hashlib
 from collections import defaultdict
+from enum import Enum
 
-# Third-party libraries must be installed
+# --- Third-party library validation ---
 try:
     import py7zr
+    import toml
     from pyfakefs.fake_filesystem_patcher import Patcher
 except ImportError:
     print("Error: Required packages are not installed.")
-    print("Please run: pip install pyfakefs py7zr")
+    print("Please run: pip install pyfakefs py7zr toml")
     sys.exit(1)
 
-# --- Import the refactored scripts ---
+# --- Training script import validation ---
 try:
     from musubi_tuner import qwen_image_cache_text_encoder_outputs as cache_encoder_script
     from musubi_tuner import qwen_image_cache_latents as cache_latents_script
@@ -28,114 +30,72 @@ except ImportError as e:
     print("Please ensure this script is run from the correct directory or adjust sys.path.")
     sys.exit(1)
 
+# --- Helper classes and functions for argparse ---
+class DynamoBackend(Enum):
+    NO = "NO"; EAGER = "eager"; AOT_EAGER = "aot_eager"; INDUCTOR = "inductor"
+    AOT_NVFUSER = "aot_nvfuser"; NVFUSER = "nvfuser"; OFI = "ofi"; FX2TRT = "fx2trt"
+    ONNXRT = "onnxrt"; IPEX = "ipex"
 
-def setup_real_directories():
-    """Creates temporary directories on the real filesystem for outputs and caches."""
-    session_dir = tempfile.mkdtemp()
-    real_output_dir = os.path.join(session_dir, "outputs")
-    real_cache_dir = os.path.join(session_dir, "caches")
-    os.makedirs(real_output_dir, exist_ok=True)
-    os.makedirs(real_cache_dir, exist_ok=True)
+def int_or_float(value):
+    if '%' in value:
+        return float(value.strip('%')) / 100.0
+    try:
+        v = float(value)
+        return int(v) if v.is_integer() else v
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid value: {value}")
+
+# --- Core Orchestrator Functions ---
+
+def prepare_real_directories(args):
+    """Ensures output and cache directories exist, creating temporary ones if not specified."""
+    if args.output_dir is None:
+        temp_session_dir = tempfile.mkdtemp()
+        args.output_dir = os.path.join(temp_session_dir, "outputs")
+        print(f"No output directory specified. Using temporary location: {args.output_dir}")
+        atexit.register(lambda: (
+            print(f"\nCleaning up temporary session directory: {temp_session_dir}"),
+            shutil.rmtree(temp_session_dir, ignore_errors=True)
+        ))
+    else:
+        print(f"Using user-specified output directory: {args.output_dir}")
+
+    if args.cache_dir is None:
+        args.cache_dir = os.path.join(args.output_dir, "caches")
+        print(f"No cache directory specified. Using default location: {args.cache_dir}")
+    else:
+        print(f"Using user-specified cache directory: {args.cache_dir}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(args.cache_dir, exist_ok=True)
+
+
+def load_and_configure_toml_in_memory(fs, real_toml_path, real_cache_dir, virtual_dataset_dir, virtual_config_path):
+    """Loads a TOML from the real disk, modifies it for the virtual environment, and saves it to the virtual filesystem."""
+    print(f"\nLoading and configuring '{real_toml_path}' for in-memory use...")
+    with open(real_toml_path, 'r') as f:
+        config = toml.load(f)
+
+    if 'datasets' not in config or not isinstance(config['datasets'], list):
+        raise ValueError("Dataset TOML config must contain a list under the 'datasets' key.")
+
+    for ds in config['datasets']:
+        ds['cache_dir'] = real_cache_dir
+        ds['root_dir'] = virtual_dataset_dir
     
-    print(f"Real disk storage configured:")
-    print(f"  - Final models will be saved to: {real_output_dir}")
-    print(f"  - Caches will be saved to:      {real_cache_dir}")
-
-    def cleanup():
-        print(f"\nCleaning up temporary directory: {session_dir}")
-        shutil.rmtree(session_dir, ignore_errors=True)
-    
-    atexit.register(cleanup)
-    return real_output_dir, real_cache_dir
+    fs.create_file(virtual_config_path, contents=toml.dumps(config))
+    print(f"In-memory config created at '{virtual_config_path}' with real cache path and virtual data path.")
 
 
-def define_training_parameters(real_output_dir, real_cache_dir):
-    """Defines arguments, distinguishing between virtual and real paths."""
-    args = argparse.Namespace()
-    
-    # --- Virtual (In-Memory) Paths ---
-    virtual_workspace = "/workspace"
-    virtual_model_dir = f"{virtual_workspace}/models"
-    # This path is where the anonymized dataset will reside in memory.
-    args.virtual_dataset_dir = f"{virtual_workspace}/datasets/train_data"
-
-    # --- Real (On-Disk) Paths ---
-    args.output_dir = real_output_dir
-    args.cache_dir = real_cache_dir
-    
-    # --- File/Directory Configs ---
-    args.dataset_config = f"{virtual_workspace}/dataset_config.toml"
-    args.pretrained_model_name_or_path = f"{virtual_model_dir}/qwen-vl-moe-v2.fp16.safetensors"
-    args.vae = f"{virtual_model_dir}/qwen-vl-moe-vae.fp16.safetensors"
-    args.text_encoder = f"{virtual_model_dir}/Qwen2.5-0.5B-VL-Chat"
-    args.logging_dir = os.path.join(real_output_dir, "logs")
-    args.sample_prompts = f"{virtual_workspace}/prompts.txt"
-    args.output_name = "qwen_lora_model"
-
-    # --- Other Training Arguments ---
-    args.batch_size = 4
-    args.num_workers = 2
-    args.max_resolution = "1024,1024"
-    args.skip_existing = False; args.keep_cache = True; args.debug_mode = None
-    args.disable_cudnn_backend = False; args.max_train_steps = 1500
-    args.learning_rate = 1e-4; args.optimizer_type = "AdamW8bit"
-    args.network_dim = 128; args.network_alpha = 64; args.lr_scheduler = "cosine"
-    args.save_every_n_steps = 500; args.save_model_as = "safetensors"
-    args.network_module = "networks.lora"; args.gradient_checkpointing = True
-    args.mixed_precision = "bf16"; args.log_with = "tensorboard"
-    args.sample_every_n_steps = 250; args.config_file = None; args.edit = True
-    args.edit_plus = False; args.fp8_vl = False; args.fp8_scaled = False
-    args.num_layers = None; args.split_attn = True; args.device = "cuda"
-    args.console_width = None; args.console_back = None
-    args.console_num_images = None; args.vae_dtype = None
-
-    return args
-
-
-def get_archive_data_in_memory(cache_dir_path: str, virtual_dataset_dir: str) -> io.BytesIO:
-    """Creates a dummy 7z archive in memory with the correct config."""
-    in_memory_7z = io.BytesIO()
-    
-    dataset_toml_content = f'''
-[general]
-resolution = [1024, 1024]
-shuffle_caption = true
-
-[[datasets]]
-root_dir = "{virtual_dataset_dir}"
-cache_dir = "{cache_dir_path}"
-'''.encode('utf-8')
-
-    with py7zr.SevenZipFile(in_memory_7z, 'w') as archive:
-        files_to_add = {
-            "workspace/dataset_config.toml": dataset_toml_content,
-            "workspace/prompts.txt": b'{"prompt": "a beautiful landscape"}',
-            "workspace/datasets/train_data/sensitive_image_name_1.png": b"dummy_png_1",
-            "workspace/datasets/train_data/sensitive_image_name_1.txt": b"sensitive caption 1",
-            "workspace/datasets/train_data/another_sensitive_name.png": b"dummy_png_2",
-            "workspace/datasets/train_data/another_sensitive_name.txt": b"sensitive caption 2",
-            "workspace/models/qwen-vl-moe-vae.fp16.safetensors": b"",
-            "workspace/models/qwen-vl-moe-v2.fp16.safetensors": b"",
-            "workspace/models/Qwen2.5-0.5B-VL-Chat/config.json": b'{"status": "ok"}',
-        }
-        archive.writed(files_to_add)
-        
-    in_memory_7z.seek(0)
-    return in_memory_7z, None # No password
-
-
-def anonymize_virtual_dataset(root_dir: str):
-    """
-    Walks a virtual directory, renaming files to a hash of their basename.
-    This is performed entirely in memory on the fake filesystem.
-    """
+def anonymize_virtual_dataset(fs, root_dir: str):
+    """Silently walks a virtual directory, renaming files to a hash of their basename."""
     print(f"\nAnonymizing in-memory filenames inside '{root_dir}'...")
-    if not os.path.exists(root_dir):
+    if not fs.exists(root_dir):
         print(f"Warning: Virtual directory '{root_dir}' not found. Skipping anonymization.")
         return
 
     files_by_basename = defaultdict(list)
-    for dirpath, _, filenames in os.walk(root_dir):
+    for dirpath, _, filenames in fs.walk(root_dir):
         for filename in filenames:
             basename, ext = os.path.splitext(filename)
             full_path = os.path.join(dirpath, filename)
@@ -143,59 +103,199 @@ def anonymize_virtual_dataset(root_dir: str):
 
     renamed_count = 0
     for basename, files in files_by_basename.items():
-        # Use a cryptographic hash for robust, collision-resistant names
         hashed_basename = hashlib.sha256(basename.encode('utf-8')).hexdigest()
-        
         for full_path, ext in files:
             dirpath = os.path.dirname(full_path)
             new_path = os.path.join(dirpath, f"{hashed_basename}{ext}")
-            os.rename(full_path, new_path)
+            fs.rename(full_path, new_path)
             renamed_count += 1
-            # print(f"  - Renamed {os.path.basename(full_path)} -> {os.path.basename(new_path)}")
-
-    print(f"Anonymization complete. Renamed {renamed_count} files in memory.")
+    print(f"Anonymization complete. Renamed {renamed_count} files in memory without exposing filenames.")
 
 
-def main():
+def run_pipeline(args):
     """Main orchestrator for the secure hybrid training pipeline."""
-    real_output_dir, real_cache_dir = setup_real_directories()
-    args = define_training_parameters(real_output_dir, real_cache_dir)
-    archive_data_stream, archive_password = get_archive_data_in_memory(
-        args.cache_dir, args.virtual_dataset_dir
-    )
+    prepare_real_directories(args)
+    
+    virtual_workspace = "/workspace"
+    virtual_model_dir = f"{virtual_workspace}/models"
+    virtual_dataset_dir = f"{virtual_workspace}/datasets/train_data"
+    virtual_config_path = f"{virtual_workspace}/dataset_config.toml"
+    
+    with open(args.archive_path, 'rb') as f:
+        archive_data_stream = io.BytesIO(f.read())
 
     with Patcher() as patcher:
         fs = patcher.fs
-        fs.add_real_directory(real_output_dir)
-        fs.add_real_directory(real_cache_dir)
         
+        print("\nMounting real paths into virtual filesystem...")
+        virtual_vae_path = f"{virtual_model_dir}/vae.safetensors"
+        virtual_dit_path = f"{virtual_model_dir}/dit_model.safetensors"
+        virtual_text_encoder_path = f"{virtual_model_dir}/text_encoder"
+        
+        fs.add_real_file(args.vae_path, target_path=virtual_vae_path)
+        fs.add_real_file(args.pretrained_model_name_or_path, target_path=virtual_dit_path)
+        fs.add_real_directory(args.text_encoder_path, target_path=virtual_text_encoder_path)
+        fs.add_real_directory(args.output_dir)
+        fs.add_real_directory(args.cache_dir)
+        print("Mounting complete.")
+
         print("\nExtracting archive into virtual filesystem...")
-        with py7zr.SevenZipFile(archive_data_stream, 'r', password=archive_password) as archive:
+        with py7zr.SevenZipFile(archive_data_stream, 'r', password=args.password) as archive:
             archive.extractall(path="/")
         print("Extraction complete.")
 
-        # --- NEW ANONYMIZATION STEP ---
-        # Rename the sensitive source files in memory before any scripts see them.
-        anonymize_virtual_dataset(args.virtual_dataset_dir)
+        load_and_configure_toml_in_memory(fs, args.dataset_config_path, args.cache_dir, virtual_dataset_dir, virtual_config_path)
+        anonymize_virtual_dataset(fs, virtual_dataset_dir)
         
-        # --- Execute Pipeline ---
+        # --- STAGE 1 & 2: Caching ---
         print("\n--- STAGE 1: Caching Text Encoder Outputs ---")
-        cache_encoder_script.main_exec(args)
+        cache_encoder_args = argparse.Namespace(
+            dataset_config=virtual_config_path, text_encoder=virtual_text_encoder_path,
+            batch_size=4, fp8_vl=True, device=args.device, num_workers=args.max_data_loader_n_workers,
+            skip_existing=False, keep_cache=True, edit=args.edit, edit_plus=args.edit_plus,
+            max_resolution=args.max_resolution,
+        )
+        cache_encoder_script.main_exec(cache_encoder_args)
         print("--- STAGE 1 COMPLETE ---\n")
 
         print("--- STAGE 2: Caching Latents ---")
-        cache_latents_script.main_exec(args)
+        cache_latents_args = argparse.Namespace(
+            dataset_config=virtual_config_path, vae=virtual_vae_path, device=args.device, batch_size=4,
+            num_workers=args.max_data_loader_n_workers, max_resolution=args.max_resolution,
+            skip_existing=False, keep_cache=True, edit=args.edit, edit_plus=args.edit_plus,
+            debug_mode=None, console_width=None, console_back=None, console_num_images=None,
+            disable_cudnn_backend=False, vae_dtype=args.vae_dtype
+        )
+        cache_latents_script.main_exec(cache_latents_args)
         print("--- STAGE 2 COMPLETE ---\n")
         
+        # --- STAGE 3: Training Network ---
         print("--- STAGE 3: Training Network ---")
+        args.dataset_config = virtual_config_path
+        args.vae = virtual_vae_path
+        args.text_encoder = virtual_text_encoder_path
+        args.pretrained_model_name_or_path = virtual_dit_path
+        args.dit = virtual_dit_path # Some scripts might use this alias
         train_network_script.main_exec(args)
         print("--- STAGE 3 COMPLETE ---\n")
 
         print(">>> Secure hybrid training pipeline finished successfully. <<<")
-        final_model_path = os.path.join(args.output_dir, f"{args.output_name}.{args.save_model_as}")
-        print(f"\nFinal model and caches saved to real disk in: {os.path.dirname(real_output_dir)}")
-        print(f"All sensitive source data was processed exclusively in memory.")
+        print(f"\nFinal model and logs saved to: {args.output_dir}")
+        print(f"Caches saved to: {args.cache_dir}")
+
+
+def setup_main_parser():
+    parser = argparse.ArgumentParser(description="Securely run a Qwen-Image training pipeline using an in-memory filesystem.")
+
+    # --- Path Arguments ---
+    g_paths = parser.add_argument_group('Path Arguments')
+    g_paths.add_argument("--archive_path", type=str, required=True, help="Path to the .7z archive with dataset images/captions.")
+    g_paths.add_argument("--dataset_config_path", type=str, required=True, help="Path to the dataset .toml config file on your real disk.")
+    g_paths.add_argument("--vae_path", type=str, required=True, help="Path to the VAE model file (.safetensors).")
+    g_paths.add_argument("--text_encoder_path", type=str, required=True, help="Path to the text encoder model directory.")
+    g_paths.add_argument("--pretrained_model_name_or_path", type=str, required=True, help="Path to the pretrained DiT model file (.safetensors).")
+    g_paths.add_argument("--output_dir", type=str, default=None, help="Directory to save final models and logs. (Default: a temporary directory)")
+    g_paths.add_argument("--cache_dir", type=str, default=None, help="Directory to save caches. (Default: a 'caches' subfolder in the output directory)")
+    g_paths.add_argument("--password", type=str, default=None, help="Password for the .7z archive, if it is encrypted.")
+    g_paths.add_argument("--network_weights", type=str, default=None, help="Path to pretrained weights for the network (LoRA, etc).")
+    g_paths.add_argument("--base_weights", type=str, default=None, nargs="*", help="Network weights to merge into the model before training.")
+    g_paths.add_argument("--sample_prompts", type=str, default=None, help="File with prompts for generating sample images.")
+    g_paths.add_argument("--config_file", type=str, default=None, help="Load hyperparameters from a .toml file instead of command line.")
+
+    # --- Core Training Arguments ---
+    g_train = parser.add_argument_group('Core Training Arguments')
+    g_train.add_argument("--output_name", type=str, default="qwen_lora_model", help="Basename for saved model files.")
+    g_train.add_argument("--max_train_steps", type=int, default=1600, help="Total number of training steps.")
+    g_train.add_argument("--max_train_epochs", type=int, default=None, help="Training epochs (overrides max_train_steps).")
+    g_train.add_argument("--max_data_loader_n_workers", type=int, default=8, help="Max num workers for DataLoader.")
+    g_train.add_argument("--persistent_data_loader_workers", action="store_true", help="Persistent DataLoader workers.")
+    g_train.add_argument("--seed", type=int, default=None, help="Random seed for training.")
+    g_train.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of steps to accumulate gradients.")
+    g_train.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"], help="Mixed precision training.")
+    g_train.add_argument("--device", type=str, default="cuda", help="Device to train on ('cuda' or 'cpu').")
+    g_train.add_argument("--vae_dtype", type=str, default="bfloat16", help="Data type for VAE (e.g., float16, bfloat16).")
+    
+    # --- Network Configuration ---
+    g_net = parser.add_argument_group('Network Configuration')
+    g_net.add_argument("--network_module", type=str, required=True, help="Network module to use (e.g., 'networks.lora').")
+    g_net.add_argument("--network_dim", type=int, default=128, help="Dimension of the network (rank for LoRA).")
+    g_net.add_argument("--network_alpha", type=float, default=64, help="Alpha for LoRA weight scaling.")
+    g_net.add_argument("--network_dropout", type=float, default=None, help="Dropout rate for network.")
+    g_net.add_argument("--network_args", type=str, default=None, nargs="*", help="Additional key=value arguments for the network.")
+    g_net.add_argument("--dim_from_weights", action="store_true", help="Automatically determine dim (rank) from network_weights.")
+    g_net.add_argument("--scale_weight_norms", type=float, default=None, help="Scale the weight of each key pair to help prevent overtraining.")
+    g_net.add_argument("--base_weights_multiplier", type=float, default=None, nargs="*", help="Multiplier for base_weights.")
+
+    # --- Optimizer and LR Scheduler ---
+    g_opt = parser.add_argument_group('Optimizer and LR Scheduler')
+    g_opt.add_argument("--optimizer_type", type=str, default="AdamW8bit", help="Optimizer to use.")
+    g_opt.add_argument("--optimizer_args", type=str, default=None, nargs="*", help="Additional arguments for the optimizer.")
+    g_opt.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
+    g_opt.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm (0 for no clipping).")
+    g_opt.add_argument("--lr_scheduler", type=str, default="cosine", help="Learning rate scheduler.")
+    g_opt.add_argument("--lr_warmup_steps", type=int_or_float, default=0, help="Number of warmup steps for LR scheduler.")
+    g_opt.add_argument("--lr_decay_steps", type=int_or_float, default=0, help="Number of decay steps for LR scheduler.")
+    g_opt.add_argument("--lr_scheduler_num_cycles", type=int, default=1, help="Number of cycles for cosine with restarts.")
+    g_opt.add_argument("--lr_scheduler_power", type=float, default=1, help="Power for polynomial scheduler.")
+    g_opt.add_argument("--lr_scheduler_timescale", type=int, default=None, help="Inverse sqrt timescale for inverse sqrt scheduler.")
+    g_opt.add_argument("--lr_scheduler_min_lr_ratio", type=float, default=None, help="Minimum learning rate as a ratio of the initial LR.")
+    g_opt.add_argument("--lr_scheduler_type", type=str, default="", help="Custom scheduler module.")
+    g_opt.add_argument("--lr_scheduler_args", type=str, default=None, nargs="*", help="Additional arguments for scheduler.")
+
+    # --- Qwen-Image & Timestep Arguments ---
+    g_qwen = parser.add_argument_group('Qwen-Image & Timestep Arguments')
+    g_qwen.add_argument("--edit", action="store_true", default=True, help="Enable training for Qwen-Image-Edit.")
+    g_qwen.add_argument("--edit_plus", action="store_true", help="Enable training for Qwen-Image-Edit-2509.")
+    g_qwen.add_argument("--num_layers", type=int, default=None, help="Number of layers in the DiT model (default is 60).")
+    g_qwen.add_argument("--timestep_sampling", choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"], default="sigma", help="Method to sample timesteps.")
+    g_qwen.add_argument("--discrete_flow_shift", type=float, default=1.0, help="Discrete flow shift for the Euler Discrete Scheduler.")
+    g_qwen.add_argument("--weighting_scheme", type=str, default="none", choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"], help="Weighting scheme for timestep distribution.")
+
+    # --- Performance & Optimization ---
+    g_perf = parser.add_argument_group('Performance & Optimization')
+    g_perf.add_argument("--gradient_checkpointing", action="store_true", help="Enable gradient checkpointing.")
+    g_perf.add_argument("--gradient_checkpointing_cpu_offload", action="store_true", help="Enable CPU offloading of activation for gradient checkpointing.")
+    g_perf.add_argument("--sdpa", action="store_true", help="Use sdpa for CrossAttention (PyTorch 2.0+).")
+    g_perf.add_argument("--flash_attn", action="store_true", help="Use FlashAttention for CrossAttention.")
+    g_perf.add_argument("--flash3", action="store_true", help="Use FlashAttention 3 for CrossAttention.")
+    g_perf.add_argument("--sage_attn", action="store_true", help="Use SageAttention.")
+    g_perf.add_argument("--xformers", action="store_true", help="Use xformers for CrossAttention.")
+    g_perf.add_argument("--split_attn", action="store_true", help="Use split attention calculation.")
+    g_perf.add_argument("--fp8_base", action="store_true", help="Use fp8 for base model.")
+    g_perf.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT model.")
+    g_perf.add_argument("--dynamo_backend", type=str, default="NO", choices=[e.value for e in DynamoBackend], help="Dynamo backend type.")
+    g_perf.add_argument("--dynamo_mode", type=str, default=None, choices=["default", "reduce-overhead", "max-autotune"], help="Dynamo mode.")
+    g_perf.add_argument("--blocks_to_swap", type=int, default=None, help="Number of blocks to swap in the model.")
+    g_perf.add_argument("--img_in_txt_in_offloading", action="store_true", help="Offload img_in and txt_in to CPU.")
+
+    # --- DDP Arguments ---
+    g_ddp = parser.add_argument_group('Distributed Training (DDP) Arguments')
+    g_ddp.add_argument("--ddp_timeout", type=int, default=None, help="DDP timeout in minutes.")
+    g_ddp.add_argument("--ddp_gradient_as_bucket_view", action="store_true", help="Enable gradient_as_bucket_view for DDP.")
+    g_ddp.add_argument("--ddp_static_graph", action="store_true", help="Enable static_graph for DDP.")
+
+    # --- Logging, Saving & Metadata ---
+    g_log = parser.add_argument_group('Logging, Saving & Metadata')
+    g_log.add_argument("--logging_dir", type=str, default=None, help="Enable logging and output TensorBoard log to this directory.")
+    g_log.add_argument("--log_with", type=str, default=None, choices=["tensorboard", "wandb", "all"], help="Logging tool to use.")
+    g_log.add_argument("--log_prefix", type=str, default=None, help="Add prefix for each log directory.")
+    g_log.add_argument("--wandb_api_key", type=str, default=None, help="WandB API key.")
+    g_log.add_argument("--save_model_as", type=str, default="safetensors", choices=["safetensors", "ckpt", "pt"], help="Format to save the model in.")
+    g_log.add_argument("--save_every_n_steps", type=int, default=500, help="Save a checkpoint every N steps.")
+    g_log.add_argument("--save_every_n_epochs", type=int, default=None, help="Save a checkpoint every N epochs.")
+    g_log.add_argument("--save_last_n_epochs", type=int, default=None, help="Keep only the last N checkpoints (epochs).")
+    g_log.add_argument("--save_last_n_steps", type=int, default=None, help="Keep only checkpoints from the last N steps.")
+    g_log.add_argument("--save_state", action="store_true", help="Save optimizer state with checkpoints.")
+    g_log.add_argument("--save_state_on_train_end", action="store_true", help="Save state at the end of training.")
+    g_log.add_argument("--sample_every_n_steps", type=int, default=None, help="Generate sample images every N steps.")
+    g_log.add_argument("--sample_every_n_epochs", type=int, default=None, help="Generate sample images every N epochs.")
+    g_log.add_argument("--no_metadata", action="store_true", help="Do not save metadata in the output model.")
+    g_log.add_argument("--training_comment", type=str, default=None, help="Arbitrary comment string stored in metadata.")
+    
+    return parser
 
 
 if __name__ == "__main__":
-    main()
+    parser = setup_main_parser()
+    args = parser.parse_args()
+    run_pipeline(args)
