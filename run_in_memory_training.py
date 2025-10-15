@@ -61,7 +61,7 @@ def load_and_configure_toml_in_memory(fs, real_toml_path, real_cache_dir, virtua
     print(f"\nLoading and configuring '{real_toml_path}' for in-memory use...")
     with open(real_toml_path, 'r') as f: config = toml.load(f)
     if 'datasets' not in config or not isinstance(config['datasets'], list): raise ValueError("Dataset TOML must contain a 'datasets' list.")
-    for ds in config['datasets']: ds['cache_dir'] = real_cache_dir; ds['root_dir'] = virtual_dataset_dir
+    for ds in config['datasets']: ds['cache_directory'] = real_cache_dir; ds['image_directory'] = virtual_dataset_dir
     fs.create_file(virtual_config_path, contents=toml.dumps(config))
     print(f"In-memory config created at '{virtual_config_path}'.")
 
@@ -127,7 +127,7 @@ def run_pipeline(args):
         print("\nExtracting in-memory tar.gz into virtual filesystem...")
         import tarfile
         with tarfile.open(fileobj=io.BytesIO(tar_gz_bytes), mode='r:gz') as tar:
-            tar.extractall(path="/")
+            tar.extractall(path=virtual_dataset_dir)
         print("Extraction to virtual filesystem complete.")
 
         load_and_configure_toml_in_memory(fs, args.dataset_config_path, args.cache_dir, virtual_dataset_dir, virtual_config_path)
