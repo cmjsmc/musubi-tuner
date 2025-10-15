@@ -69,7 +69,7 @@ def anonymize_virtual_dataset(fs, root_dir: str):
     print(f"\nAnonymizing in-memory filenames inside '{root_dir}'...")
     if not fs.exists(root_dir): print(f"Warning: Virtual directory '{root_dir}' not found. Skipping anonymization."); return
     files_by_basename = defaultdict(list)
-    for dirpath, _, filenames in fs.walk(root_dir):
+    for dirpath, _, filenames in os.walk(root_dir):
         for filename in filenames:
             basename, ext = os.path.splitext(filename); full_path = os.path.join(dirpath, filename)
             files_by_basename[basename].append((full_path, ext))
