@@ -137,10 +137,10 @@ def run_pipeline(args):
             # fs.add_real_directory('/proc/meminfo')
             # fs.add_real_directory('/usr/local')
             system_paths_to_mount = [
-            '/', '/bin', '/boot', '/colab_requirements.txt', '/content', '/cuda-keyring_1.1-1_all.deb',
-            '/datalab', '/dev', '/etc', '/home', '/kaggle', '/kaggle_requirements.txt', '/lib',
-            '/lib32', '/lib64', '/libx32', '/media', '/mnt', '/NGC-DL-CONTAINER-LICENSE', '/opt',
-            '/proc', '/python-apt', '/python-apt.tar.xz', '/requirements.txt', '/root', '/run',
+            '/bin', '/boot', '/colab_requirements.txt', '/content', 
+            '/datalab', '/dev', '/etc', '/home', '/kaggle', '/lib',
+            '/lib32', '/lib64', '/libx32', '/media', '/mnt', '/opt',
+            '/proc', '/python-apt', '/root', '/run',
             '/sbin', '/srv', '/sys', '/tmp', '/tools', '/usr', '/var'
             ]
             
