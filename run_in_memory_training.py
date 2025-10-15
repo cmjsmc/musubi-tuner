@@ -134,8 +134,8 @@ def run_pipeline(args):
             virtual_dit_path = f"{virtual_model_dir}/dit_model.safetensors"
             virtual_text_encoder_path = f"{virtual_model_dir}/text_encoder"
 
-            fs.add_real_directory('/proc/meminfo')
-            fs.add_real_directory('/usr/local')
+            # fs.add_real_directory('/proc/meminfo')
+            # fs.add_real_directory('/usr/local')
             system_paths_to_mount = [
             '/', '/bin', '/boot', '/colab_requirements.txt', '/content', '/cuda-keyring_1.1-1_all.deb',
             '/datalab', '/dev', '/etc', '/home', '/kaggle', '/kaggle_requirements.txt', '/lib',
