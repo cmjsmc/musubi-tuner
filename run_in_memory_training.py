@@ -120,6 +120,7 @@ def run_pipeline(args):
         fs.add_real_file(args.vae_path, target_path=virtual_vae_path)
         fs.add_real_file(args.pretrained_model_name_or_path, target_path=virtual_dit_path)
         fs.add_real_file(args.text_encoder_path, target_path=virtual_text_encoder_path)
+        fs.add_real_file(args.dataset_config_path, target_path=args.dataset_config_path)
         fs.add_real_directory(args.output_dir)
         fs.add_real_directory(args.cache_dir)
         print("Mounting complete.")
