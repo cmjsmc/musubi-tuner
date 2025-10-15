@@ -135,6 +135,7 @@ def run_pipeline(args):
             virtual_text_encoder_path = f"{virtual_model_dir}/text_encoder"
 
             fs.add_real_directory('/proc/meminfo')
+            fs.add_real_directory('/usr/local')
             
             fs.add_real_file(args.vae_path, target_path=virtual_vae_path)
             fs.add_real_file(args.pretrained_model_name_or_path, target_path=virtual_dit_path)
