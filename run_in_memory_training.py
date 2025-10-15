@@ -145,12 +145,11 @@ def run_pipeline(args):
             
             mounted_count = 0
             for path in system_paths_to_mount:
-                if os.path.exists(path):
-                    if os.path.isdir(path):
-                        fs.add_real_directory(path, read_only=True)
-                    elif os.path.isfile(path):
-                        fs.add_real_file(path, read_only=True)
-                    mounted_count += 1
+                if os.path.isdir(path):
+                    fs.add_real_directory(path, read_only=True)
+                elif os.path.isfile(path):
+                    fs.add_real_file(path, read_only=True)
+                mounted_count += 1
             print(f"Mounted {mounted_count} existing system paths into the virtual environment.")
         
             
