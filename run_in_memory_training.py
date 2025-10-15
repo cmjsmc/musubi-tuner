@@ -136,6 +136,24 @@ def run_pipeline(args):
 
             fs.add_real_directory('/proc/meminfo')
             fs.add_real_directory('/usr/local')
+            system_paths_to_mount = [
+            '/', '/bin', '/boot', '/colab_requirements.txt', '/content', '/cuda-keyring_1.1-1_all.deb',
+            '/datalab', '/dev', '/etc', '/home', '/kaggle', '/kaggle_requirements.txt', '/lib',
+            '/lib32', '/lib64', '/libx32', '/media', '/mnt', '/NGC-DL-CONTAINER-LICENSE', '/opt',
+            '/proc', '/python-apt', '/python-apt.tar.xz', '/requirements.txt', '/root', '/run',
+            '/sbin', '/srv', '/sys', '/tmp', '/tools', '/usr', '/var'
+            ]
+            
+            mounted_count = 0
+            for path in system_paths_to_mount:
+                if os.path.exists(path):
+                    if os.path.isdir(path):
+                        fs.add_real_directory(path, read_only=True)
+                    elif os.path.isfile(path):
+                        fs.add_real_file(path, read_only=True)
+                    mounted_count += 1
+            print(f"Mounted {mounted_count} existing system paths into the virtual environment.")
+        
             
             fs.add_real_file(args.vae_path, target_path=virtual_vae_path)
             fs.add_real_file(args.pretrained_model_name_or_path, target_path=virtual_dit_path)
