@@ -137,8 +137,7 @@ def run_pipeline(args):
             # fs.add_real_directory('/proc/meminfo')
             # fs.add_real_directory('/usr/local')
             system_paths_to_mount = [
-            '/bin', '/boot', '/colab_requirements.txt', '/content', 
-            '/datalab', '/dev', '/etc', '/home', '/kaggle', '/lib',
+            '/datalab', '/dev', '/etc', '/home', '/lib',
             '/lib32', '/lib64', '/libx32', '/media', '/mnt', '/opt',
             '/proc', '/python-apt', '/root', '/run',
             '/sbin', '/srv', '/sys', '/tmp', '/tools', '/usr', '/var'
