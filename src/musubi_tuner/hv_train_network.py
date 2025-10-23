@@ -2311,6 +2311,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         help="config file for dataset / データセットの設定ファイル",
     )
+    parser.add_argument(
+        "--dataset_passphrase",
+        type=str,
+        default=None,
+        help="passphrase for encrypted dataset archives (.tar.gz.gpg) / 暗号化されたデータセットアーカイブのパスフレーズ",
+    )
 
     # training settings
     parser.add_argument(
