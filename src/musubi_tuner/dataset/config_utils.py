@@ -118,6 +118,7 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "dataset_passphrase": str,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
@@ -241,7 +242,7 @@ class BlueprintGenerator:
                 dataset_params_klass = VideoDatasetParams
 
             params = self.generate_params_by_fallbacks(
-                dataset_params_klass, [dataset_config, general_config, argparse_config, runtime_params]
+                dataset_params_klass, [argparse_config, dataset_config, general_config, runtime_params]
             )
             dataset_blueprints.append(DatasetBlueprint(is_image_dataset, params))
 
