@@ -23,7 +23,7 @@ import logging
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.ERROR)
+logging.basicConfig(level=logging.INFO)
 
 
 def encode_prompt(text_encoder: TextEncoder, prompt: Union[str, list[str]]):
@@ -212,6 +212,9 @@ def setup_parser_common():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_config", type=str, required=True, help="path to dataset config .toml file")
+    parser.add_argument(
+        "--dataset_passphrase", type=str, default=None, help="passphrase for encrypted dataset archives (.tar.gz.gpg)"
+    )
     parser.add_argument("--device", type=str, default=None, help="device to use, default is cuda if available")
     parser.add_argument(
         "--batch_size", type=int, default=None, help="batch size, override dataset config if dataset batch size > this"
