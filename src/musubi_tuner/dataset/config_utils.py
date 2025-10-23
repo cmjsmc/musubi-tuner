@@ -26,7 +26,7 @@ from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset,
 import logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 @dataclass
