@@ -23,7 +23,7 @@ import logging
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def encode_prompt(text_encoder: TextEncoder, prompt: Union[str, list[str]]):
