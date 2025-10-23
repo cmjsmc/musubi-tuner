@@ -1,10 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
 from importlib.util import find_spec
+import io
 import json
 import math
 import os
 import random
+import tarfile
 import time
 from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
 
@@ -20,6 +22,12 @@ from safetensors.torch import save_file, load_file
 from PIL import Image
 import cv2
 import av
+
+try:
+    import gnupg
+except ImportError:
+    gnupg = None
+
 
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import dtype_to_str
@@ -545,7 +553,7 @@ class BucketSelector:
 
 
 def load_video(
-    video_path: str,
+    video_path_or_obj: Union[str, Any],
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
     bucket_selector: Optional[BucketSelector] = None,
@@ -556,9 +564,10 @@ def load_video(
     """
     bucket_reso: if given, resize the video to the bucket resolution, (width, height)
     """
+    is_path = isinstance(video_path_or_obj, (str, os.PathLike))
     if source_fps is None or target_fps is None:
-        if os.path.isfile(video_path):
-            container = av.open(video_path)
+        if (is_path and os.path.isfile(video_path_or_obj)) or not is_path:
+            container = av.open(video_path_or_obj)
             video = []
             for i, frame in enumerate(container.decode(video=0)):
                 if start_frame is not None and i < start_frame:
@@ -579,7 +588,7 @@ def load_video(
             container.close()
         else:
             # load images in the directory
-            image_files = glob_images(video_path)
+            image_files = glob_images(video_path_or_obj)
             image_files.sort()
             video = []
             for i in range(len(image_files)):
@@ -601,8 +610,8 @@ def load_video(
     else:
         # drop frames to match the target fps TODO commonize this code with the above if this works
         frame_index_delta = target_fps / source_fps  # example: 16 / 30 = 0.5333
-        if os.path.isfile(video_path):
-            container = av.open(video_path)
+        if (is_path and os.path.isfile(video_path_or_obj)) or not is_path:
+            container = av.open(video_path_or_obj)
             video = []
             frame_index_with_fraction = 0.0
             previous_frame_index = -1
@@ -634,7 +643,7 @@ def load_video(
             container.close()
         else:
             # load images in the directory
-            image_files = glob_images(video_path)
+            image_files = glob_images(video_path_or_obj)
             image_files.sort()
             video = []
             frame_index_with_fraction = 0.0
@@ -958,6 +967,139 @@ class ImageDirectoryDatasource(ImageDatasource):
         return fetcher
 
 
+class ImageTarDatasource(ImageDatasource):
+    def __init__(
+        self,
+        image_tar_file: str,
+        caption_extension: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        control_count_per_image: Optional[int] = None,
+        dataset_passphrase: Optional[str] = None,
+    ):
+        super().__init__()
+        self.image_tar_file = image_tar_file
+        self.caption_extension = caption_extension
+        self.current_idx = 0
+
+        logger.info(f"opening data source: {self.image_tar_file}")
+
+        if self.image_tar_file.endswith(".gpg"):
+            if gnupg is None:
+                raise ImportError("python-gnupg is not installed. Please install it to use encrypted datasets.")
+            if not dataset_passphrase:
+                raise ValueError("Dataset is encrypted, but no passphrase was provided via --dataset_passphrase.")
+
+            gpg = gnupg.GPG()
+            with open(self.image_tar_file, "rb") as f:
+                decrypted_data = gpg.decrypt_file(f, passphrase=dataset_passphrase)
+                if not decrypted_data.ok:
+                    raise RuntimeError(f"Failed to decrypt file: {decrypted_data.status}")
+                # Decrypted data is in memory, wrap it in a file-like object
+                decrypted_stream = io.BytesIO(decrypted_data.data)
+            self.tar_file = tarfile.open(fileobj=decrypted_stream, mode="r:gz")
+        else:
+            self.tar_file = tarfile.open(self.image_tar_file, "r:gz")
+
+        # Build an index of files
+        self.image_members = []
+        caption_map = {}  # basename -> member
+        all_members = self.tar_file.getmembers()
+
+        for member in all_members:
+            if not member.isfile():
+                continue
+
+            file_path = member.name
+            _, extension = os.path.splitext(file_path)
+
+            if extension.lower() in IMAGE_EXTENSIONS:
+                self.image_members.append(member)
+            elif self.caption_extension and extension == self.caption_extension:
+                caption_basename = os.path.basename(os.path.splitext(file_path)[0])
+                caption_map[caption_basename] = member
+
+        self.image_members.sort(key=lambda m: m.name)
+
+        # Create a map from image member to caption member
+        self.caption_members = {}
+        for img_member in self.image_members:
+            img_basename = os.path.basename(os.path.splitext(img_member.name)[0])
+            if img_basename in caption_map:
+                self.caption_members[img_member.name] = caption_map[img_basename]
+
+        logger.info(f"found {len(self.image_members)} images in data source")
+
+        # Control images are not supported in tar files for now.
+        self.has_control = False
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.image_members)
+
+    def get_image_data(self, idx: int) -> tuple[str, Image.Image, str, Optional[Image.Image]]:
+        image_member = self.image_members[idx]
+        image_key = image_member.name
+
+        extracted_file = self.tar_file.extractfile(image_member)
+        if extracted_file is None:
+            raise IOError(f"Could not extract file from tar: {image_key}")
+        with extracted_file as f:
+            image_bytes = io.BytesIO(f.read())
+            image = Image.open(image_bytes).convert("RGB")
+
+        _, caption = self.get_caption(idx)
+
+        # No controls for tar files.
+        controls = None
+
+        return image_key, image, caption, controls
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        image_member = self.image_members[idx]
+        image_key = image_member.name
+
+        caption = ""
+        if image_key in self.caption_members:
+            caption_member = self.caption_members[image_key]
+            extracted_file = self.tar_file.extractfile(caption_member)
+            if extracted_file is None:
+                logger.warning(f"Could not extract caption file from tar: {caption_member.name}")
+                return image_key, ""
+            with extracted_file as f:
+                caption = f.read().decode("utf-8").strip()
+
+        return image_key, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        """
+        Returns a fetcher function that returns image data.
+        """
+        if self.current_idx >= len(self.image_members):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+        else:
+
+            def create_image_fetcher(index):
+                return lambda: self.get_image_data(index)
+
+            fetcher = create_image_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
 class ImageJsonlDatasource(ImageDatasource):
     def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None):
         super().__init__()
@@ -1246,6 +1388,155 @@ class VideoDirectoryDatasource(VideoDatasource):
         return fetcher
 
 
+class VideoTarDatasource(VideoDatasource):
+    def __init__(self, video_tar_file: str, caption_extension: Optional[str] = None, control_directory: Optional[str] = None, dataset_passphrase: Optional[str] = None):
+        super().__init__()
+        self.video_tar_file = video_tar_file
+        self.caption_extension = caption_extension
+        self.current_idx = 0
+
+        logger.info(f"opening data source: {self.video_tar_file}")
+        if self.video_tar_file.endswith(".gpg"):
+            if gnupg is None:
+                raise ImportError("python-gnupg is not installed. Please install it to use encrypted datasets.")
+            if not dataset_passphrase:
+                raise ValueError("Dataset is encrypted, but no passphrase was provided via --dataset_passphrase.")
+
+            gpg = gnupg.GPG()
+            with open(self.video_tar_file, "rb") as f:
+                decrypted_data = gpg.decrypt_file(f, passphrase=dataset_passphrase)
+                if not decrypted_data.ok:
+                    raise RuntimeError(f"Failed to decrypt file: {decrypted_data.status}")
+                decrypted_stream = io.BytesIO(decrypted_data.data)
+            self.tar_file = tarfile.open(fileobj=decrypted_stream, mode="r:gz")
+        else:
+            self.tar_file = tarfile.open(self.video_tar_file, "r:gz")
+
+        # Build an index of files
+        self.video_members = []
+        caption_map = {}
+        all_members = self.tar_file.getmembers()
+
+        for member in all_members:
+            if not member.isfile():
+                continue
+
+            file_path = member.name
+            _, extension = os.path.splitext(file_path)
+
+            if extension.lower() in VIDEO_EXTENSIONS:
+                self.video_members.append(member)
+            elif self.caption_extension and extension == self.caption_extension:
+                caption_basename = os.path.basename(os.path.splitext(file_path)[0])
+                caption_map[caption_basename] = member
+
+        self.video_members.sort(key=lambda m: m.name)
+
+        self.caption_members = {}
+        for vid_member in self.video_members:
+            vid_basename = os.path.basename(os.path.splitext(vid_member.name)[0])
+            if vid_basename in caption_map:
+                self.caption_members[vid_member.name] = caption_map[vid_basename]
+
+        logger.info(f"found {len(self.video_members)} videos in data source")
+        self.has_control = False
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.video_members)
+
+    def get_video_data_from_path(
+            self,
+            video_member: tarfile.TarInfo,
+            start_frame: Optional[int] = None,
+            end_frame: Optional[int] = None,
+            bucket_selector: Optional[BucketSelector] = None,
+    ) -> list[np.ndarray]:
+        extracted_file = self.tar_file.extractfile(video_member)
+        if extracted_file is None:
+            raise IOError(f"Could not extract file from tar: {video_member.name}")
+        with extracted_file as f:
+            video = load_video(
+                f,
+                start_frame=start_frame,
+                end_frame=end_frame,
+                bucket_selector=bucket_selector,
+                source_fps=self.source_fps,
+                target_fps=self.target_fps,
+            )
+        return video
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        video_member = self.video_members[idx]
+        video_key = video_member.name
+
+        caption = ""
+        if video_key in self.caption_members:
+            caption_member = self.caption_members[video_key]
+            extracted_file = self.tar_file.extractfile(caption_member)
+            if extracted_file is None:
+                logger.warning(f"Could not extract caption file from tar: {caption_member.name}")
+                return video_key, ""
+            with extracted_file as f:
+                caption = f.read().decode("utf-8").strip()
+        return video_key, caption
+
+    def get_video_data(
+        self,
+        idx: int,
+        start_frame: Optional[int] = None,
+        end_frame: Optional[int] = None,
+        bucket_selector: Optional[BucketSelector] = None,
+    ) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+        video_member = self.video_members[idx]
+        video = self.get_video_data_from_path(video_member, start_frame, end_frame, bucket_selector)
+
+        _, caption = self.get_caption(idx)
+
+        # Control videos not supported in tar files
+        control = None
+
+        return video_member.name, video, caption, control
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        video_member = self.video_members[idx]
+        video_key = video_member.name
+
+        caption = ""
+        if video_key in self.caption_members:
+            caption_member = self.caption_members[video_key]
+            with self.tar_file.extractfile(caption_member) as f:
+                caption = f.read().decode("utf-8").strip()
+        return video_key, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self):
+        if self.current_idx >= len(self.video_members):
+            raise StopIteration
+
+        if self.caption_only:
+
+            def create_caption_fetcher(index):
+                return lambda: self.get_caption(index)
+
+            fetcher = create_caption_fetcher(self.current_idx)
+
+        else:
+
+            def create_fetcher(index):
+                return lambda: self.get_video_data(index)
+
+            fetcher = create_fetcher(self.current_idx)
+
+        self.current_idx += 1
+        return fetcher
+
+
 class VideoJsonlDatasource(VideoDatasource):
     def __init__(self, video_jsonl_file: str):
         super().__init__()
@@ -1339,6 +1630,7 @@ class BaseDataset(torch.utils.data.Dataset):
         enable_bucket: bool = False,
         bucket_no_upscale: bool = False,
         cache_directory: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1349,6 +1641,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
+        self.dataset_passphrase = dataset_passphrase
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.seed = None
@@ -1502,8 +1795,10 @@ class ImageDataset(BaseDataset):
         bucket_no_upscale: bool,
         image_directory: Optional[str] = None,
         image_jsonl_file: Optional[str] = None,
+        image_tar_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
         fp_1f_target_index: Optional[int] = None,
@@ -1522,11 +1817,13 @@ class ImageDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            dataset_passphrase,
             debug_dataset,
             architecture,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
+        self.image_tar_file = image_tar_file
         self.control_directory = control_directory
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
@@ -1553,11 +1850,16 @@ class ImageDataset(BaseDataset):
             )
         elif image_jsonl_file is not None:
             self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image)
+        elif image_tar_file is not None:
+            self.datasource = ImageTarDatasource(image_tar_file, caption_extension, control_directory, control_count_per_image, dataset_passphrase)
         else:
-            raise ValueError("image_directory or image_jsonl_file must be specified")
+            raise ValueError("image_directory, image_jsonl_file, or image_tar_file must be specified")
 
         if self.cache_directory is None:
-            self.cache_directory = self.image_directory
+            if self.image_directory is not None:
+                self.cache_directory = self.image_directory
+            elif self.image_tar_file is not None:
+                raise ValueError("cache_directory must be specified when using a tar file.")
 
         self.batch_manager = None
         self.num_train_items = 0
@@ -1569,6 +1871,8 @@ class ImageDataset(BaseDataset):
             metadata["image_directory"] = os.path.basename(self.image_directory)
         if self.image_jsonl_file is not None:
             metadata["image_jsonl_file"] = os.path.basename(self.image_jsonl_file)
+        if self.image_tar_file is not None:
+            metadata["image_tar_file"] = os.path.basename(self.image_tar_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
@@ -1799,8 +2103,10 @@ class VideoDataset(BaseDataset):
         source_fps: Optional[float] = None,
         video_directory: Optional[str] = None,
         video_jsonl_file: Optional[str] = None,
+        video_tar_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
         fp_latent_window_size: Optional[int] = 9,
         debug_dataset: bool = False,
         architecture: str = "no_default",
@@ -1813,11 +2119,13 @@ class VideoDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            dataset_passphrase,
             debug_dataset,
             architecture,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
+        self.video_tar_file = video_tar_file
         self.control_directory = control_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
@@ -1858,6 +2166,10 @@ class VideoDataset(BaseDataset):
             self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
         elif video_jsonl_file is not None:
             self.datasource = VideoJsonlDatasource(video_jsonl_file)
+        elif video_tar_file is not None:
+            self.datasource = VideoTarDatasource(video_tar_file, caption_extension, control_directory, dataset_passphrase)
+        else:
+            raise ValueError("video_directory, video_jsonl_file, or video_tar_file must be specified")
 
         if self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
@@ -1867,7 +2179,10 @@ class VideoDataset(BaseDataset):
             self.datasource.set_start_and_end_frame(0, max(self.target_frames))
 
         if self.cache_directory is None:
-            self.cache_directory = self.video_directory
+            if self.video_directory is not None:
+                self.cache_directory = self.video_directory
+            elif self.video_tar_file is not None:
+                raise ValueError("cache_directory must be specified when using a tar file.")
 
         self.batch_manager = None
         self.num_train_items = 0
@@ -1879,6 +2194,8 @@ class VideoDataset(BaseDataset):
             metadata["video_directory"] = os.path.basename(self.video_directory)
         if self.video_jsonl_file is not None:
             metadata["video_jsonl_file"] = os.path.basename(self.video_jsonl_file)
+        if self.video_tar_file is not None:
+            metadata["video_tar_file"] = os.path.basename(self.video_tar_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["frame_extraction"] = self.frame_extraction
