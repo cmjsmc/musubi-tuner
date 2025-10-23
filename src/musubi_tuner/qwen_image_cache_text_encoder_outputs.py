@@ -62,10 +62,10 @@ def encode_and_save_batch(
     else:
         images = None
 
-    for i, item in enumerate(batch):
-        print(
-            f"Item {i}: {item.item_key}, prompt: {item.caption}, control images: {[im.shape for im in images[i]] if images is not None else None}"
-        )
+    # for i, item in enumerate(batch):
+    #     print(
+    #         f"Item {i}: {item.item_key}, prompt: {item.caption}, control images: {[im.shape for im in images[i]] if images is not None else None}"
+    #     )
 
     # encode prompt
     with torch.no_grad():
