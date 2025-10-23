@@ -17,7 +17,7 @@ from musubi_tuner.qwen_image import qwen_image_autoencoder_kl
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def preprocess_contents_qwen_image(batch: List[ItemInfo]) -> tuple[torch.Tensor]:
