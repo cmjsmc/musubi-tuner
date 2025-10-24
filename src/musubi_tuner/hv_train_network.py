@@ -2153,7 +2153,7 @@ class NetworkTrainer:
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.to(network_dtype), target, reduction="none")
+                    loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
 
                     if weighting is not None:
                         loss = loss * weighting
