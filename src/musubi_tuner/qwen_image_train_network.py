@@ -448,6 +448,10 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         target = noise - latents
 
+        if accelerator.mixed_precision == "fp16":
+            model_pred = model_pred.float()
+            target = target.float()
+
         # print(model_pred.dtype, target.dtype)
         return model_pred, target
 
