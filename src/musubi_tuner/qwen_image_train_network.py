@@ -444,16 +444,12 @@ class QwenImageNetworkTrainer(NetworkTrainer):
             qwen_image_utils.VAE_SCALE_FACTOR,
         )
 
-        # flow matching loss
-        if accelerator.mixed_precision == "fp16":
-            # For fp16 training, upcast to float32 for target calculation and loss to prevent numerical instability.
-            model_pred = model_pred.float()
-            target = noise.to(accelerator.device).float() - latents.to(accelerator.device).float()
-        else:
-            latents = latents.to(device=accelerator.device, dtype=network_dtype)
-            target = noise - latents
+        # flow matching loss: calculate loss in float32 to prevent numerical instability.
+        model_pred = model_pred.float()
+        noise = noise.to(device=accelerator.device, dtype=torch.float32)
+        latents = latents.to(device=accelerator.device, dtype=torch.float32)
+        target = noise - latents
 
-        # print(model_pred.dtype, target.dtype)
         return model_pred, target
 
     # endregion model specific
