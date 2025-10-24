@@ -445,12 +445,13 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         )
 
         # flow matching loss
-        latents = latents.to(device=accelerator.device, dtype=network_dtype)
-        target = noise - latents
-
         if accelerator.mixed_precision == "fp16":
+            # For fp16 training, upcast to float32 for target calculation and loss to prevent numerical instability.
             model_pred = model_pred.float()
-            target = target.float()
+            target = noise.to(accelerator.device).float() - latents.to(accelerator.device).float()
+        else:
+            latents = latents.to(device=accelerator.device, dtype=network_dtype)
+            target = noise - latents
 
         # print(model_pred.dtype, target.dtype)
         return model_pred, target
