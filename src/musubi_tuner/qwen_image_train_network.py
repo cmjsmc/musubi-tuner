@@ -1,3 +1,4 @@
+
 import argparse
 import gc
 from typing import Optional
@@ -417,13 +418,10 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         if is_edit:
             img_shapes = [img_shapes + [(1, sh[-2] // 2, sh[-1] // 2) for sh in latents_control_shapes]]
 
-        # print(
-        #     f"noisy_model_input: {noisy_model_input.shape}, vl_embed: {vl_embed.shape}, vl_mask: {vl_mask.shape if vl_mask is not None else None}, img_shapes: {img_shapes}, txt_seq_lens: {txt_seq_lens}"
-        # )
-
         guidance = None
         timesteps = timesteps / 1000.0
-        with accelerator.autocast():
+        # Force the forward pass to be computed in float32 to prevent numerical instability in attention blocks.
+        with torch.autocast(device_type=accelerator.device.type, dtype=torch.float32):
             model_pred = model(
                 hidden_states=noisy_model_input,
                 timestep=timesteps,
@@ -445,10 +443,9 @@ class QwenImageNetworkTrainer(NetworkTrainer):
         )
 
         # flow matching loss: calculate loss in float32 to prevent numerical instability.
-        model_pred = model_pred.float()
-        noise = noise.to(device=accelerator.device, dtype=torch.float32)
-        latents = latents.to(device=accelerator.device, dtype=torch.float32)
-        target = noise - latents
+        target = noise.to(device=accelerator.device, dtype=torch.float32) - latents.to(
+            device=accelerator.device, dtype=torch.float32
+        )
 
         return model_pred, target
 
