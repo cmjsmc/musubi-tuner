@@ -2153,9 +2153,13 @@ class NetworkTrainer:
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
-                    loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    # The call to `call_dit` already returns tensors in float32.
+                    # We calculate the loss directly without the redundant `.to()` calls.
+                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
 
                     if weighting is not None:
+                        # Clamp weighting to prevent multiplication by infinity.
+                        weighting = torch.clamp(weighting, max=10000)
                         loss = loss * weighting
                     # loss = loss.mean([1, 2, 3])
                     # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
