@@ -1591,8 +1591,6 @@ class NetworkTrainer:
         pos_emb_shape = latents.shape[1:]
         if pos_emb_shape not in self.pos_embed_cache:
             freqs_cos, freqs_sin = get_rotary_pos_embed_by_shape(transformer, latents.shape[2:])
-            # freqs_cos = freqs_cos.to(device=accelerator.device, dtype=dit_dtype)
-            # freqs_sin = freqs_sin.to(device=accelerator.device, dtype=dit_dtype)
             self.pos_embed_cache[pos_emb_shape] = (freqs_cos, freqs_sin)
         else:
             freqs_cos, freqs_sin = self.pos_embed_cache[pos_emb_shape]
@@ -1600,7 +1598,9 @@ class NetworkTrainer:
         # call DiT
         latents = latents.to(device=accelerator.device, dtype=network_dtype)
         noisy_model_input = noisy_model_input.to(device=accelerator.device, dtype=network_dtype)
-        with accelerator.autocast():
+        
+        # Force the forward pass to be computed in float32 to prevent numerical instability in attention blocks.
+        with torch.autocast(device_type=accelerator.device.type, dtype=torch.float32):
             model_pred = transformer(
                 noisy_model_input,
                 timesteps,
@@ -1614,7 +1614,7 @@ class NetworkTrainer:
             )
 
         # flow matching loss
-        target = noise - latents
+        target = noise.to(device=accelerator.device) - latents.to(device=accelerator.device)
 
         return model_pred, target
 
@@ -2153,13 +2153,10 @@ class NetworkTrainer:
                     model_pred, target = self.call_dit(
                         args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype
                     )
-                    # The call to `call_dit` already returns tensors in float32.
-                    # We calculate the loss directly without the redundant `.to()` calls.
-                    loss = torch.nn.functional.mse_loss(model_pred, target, reduction="none")
+                    # Always compute loss in float32 to prevent NaN issues.
+                    loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
 
                     if weighting is not None:
-                        # Clamp weighting to prevent multiplication by infinity.
-                        weighting = torch.clamp(weighting, max=10000)
                         loss = loss * weighting
                     # loss = loss.mean([1, 2, 3])
                     # # min snr gamma, scale v pred loss like noise pred, v pred like loss, debiased estimation etc.
