@@ -26,7 +26,7 @@ from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset,
 import logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 @dataclass
@@ -38,6 +38,7 @@ class BaseDatasetParams:
     batch_size: int = 1
     num_repeats: int = 1
     cache_directory: Optional[str] = None
+    dataset_passphrase: Optional[str] = None
     debug_dataset: bool = False
     architecture: str = "no_default"  # short style like "hv" or "wan"
 
@@ -46,6 +47,7 @@ class BaseDatasetParams:
 class ImageDatasetParams(BaseDatasetParams):
     image_directory: Optional[str] = None
     image_jsonl_file: Optional[str] = None
+    image_tar_file: Optional[str] = None
     control_directory: Optional[str] = None
 
     # FramePack dependent parameters
@@ -62,6 +64,7 @@ class ImageDatasetParams(BaseDatasetParams):
 class VideoDatasetParams(BaseDatasetParams):
     video_directory: Optional[str] = None
     video_jsonl_file: Optional[str] = None
+    video_tar_file: Optional[str] = None
     control_directory: Optional[str] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
@@ -115,10 +118,12 @@ class ConfigSanitizer:
         "resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
         "enable_bucket": bool,
         "bucket_no_upscale": bool,
+        "dataset_passphrase": str,
     }
     IMAGE_DATASET_DISTINCT_SCHEMA = {
         "image_directory": str,
         "image_jsonl_file": str,
+        "image_tar_file": str,
         "cache_directory": str,
         "control_directory": str,
         "fp_latent_window_size": int,
@@ -132,6 +137,7 @@ class ConfigSanitizer:
     VIDEO_DATASET_DISTINCT_SCHEMA = {
         "video_directory": str,
         "video_jsonl_file": str,
+        "video_tar_file": str,
         "control_directory": str,
         "target_frames": [int],
         "frame_extraction": str,
@@ -159,7 +165,7 @@ class ConfigSanitizer:
         )
 
         def validate_flex_dataset(dataset_config: dict):
-            if "video_directory" in dataset_config or "video_jsonl_file" in dataset_config:
+            if "video_directory" in dataset_config or "video_jsonl_file" in dataset_config or "video_tar_file" in dataset_config:
                 return Schema(self.video_dataset_schema)(dataset_config)
             else:
                 return Schema(self.image_dataset_schema)(dataset_config)
@@ -227,14 +233,16 @@ class BlueprintGenerator:
 
         dataset_blueprints = []
         for dataset_config in sanitized_user_config.get("datasets", []):
-            is_image_dataset = "image_directory" in dataset_config or "image_jsonl_file" in dataset_config
+            is_image_dataset = (
+                "image_directory" in dataset_config or "image_jsonl_file" in dataset_config or "image_tar_file" in dataset_config
+            )
             if is_image_dataset:
                 dataset_params_klass = ImageDatasetParams
             else:
                 dataset_params_klass = VideoDatasetParams
 
             params = self.generate_params_by_fallbacks(
-                dataset_params_klass, [dataset_config, general_config, argparse_config, runtime_params]
+                dataset_params_klass, [argparse_config, dataset_config, general_config, runtime_params]
             )
             dataset_blueprints.append(DatasetBlueprint(is_image_dataset, params))
 
@@ -315,6 +323,7 @@ def generate_dataset_group_by_blueprint(
                     f"""\
         image_directory: "{dataset.image_directory}"
         image_jsonl_file: "{dataset.image_jsonl_file}"
+        image_tar_file: "{getattr(dataset, 'image_tar_file', None)}"
         fp_latent_window_size: {dataset.fp_latent_window_size}
         fp_1f_clean_indices: {dataset.fp_1f_clean_indices}
         fp_1f_target_index: {dataset.fp_1f_target_index}
@@ -332,6 +341,7 @@ def generate_dataset_group_by_blueprint(
                     f"""\
         video_directory: "{dataset.video_directory}"
         video_jsonl_file: "{dataset.video_jsonl_file}"
+        video_tar_file: "{getattr(dataset, 'video_tar_file', None)}"
         control_directory: "{dataset.control_directory}"
         target_frames: {dataset.target_frames}
         frame_extraction: {dataset.frame_extraction}
