@@ -22,7 +22,7 @@ import logging
 from musubi_tuner.qwen_image import qwen_image_utils
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def encode_and_save_batch(
@@ -67,10 +67,10 @@ def encode_and_save_batch(
     else:
         images = None
 
-    for i, item in enumerate(batch):
-        print(
-            f"Item {i}: {item.item_key}, prompt: {item.caption}, control images: {[im.shape for im in images[i] if im is not None] if images is not None else None}"
-        )
+    # for i, item in enumerate(batch):
+    #     print(
+    #         f"Item {i}: {item.item_key}, prompt: {item.caption}, control images: {[im.shape for im in images[i] if im is not None] if images is not None else None}"
+    #     )
 
     # encode prompt
     with torch.no_grad():
