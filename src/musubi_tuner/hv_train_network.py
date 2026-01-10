@@ -1045,7 +1045,13 @@ class NetworkTrainer:
             plt.ylabel("Weighting")
 
             plt.tight_layout()
+
+            output_path = Path("timesteps_analysis.png")
+            plt.savefig(output_path, dpi=300) 
+            print(f"Plot successfully saved to: {output_path.resolve()}")
+            
             plt.show()
+            plt.close() 
 
         else:
             sampled_timesteps = np.array(sampled_timesteps)
