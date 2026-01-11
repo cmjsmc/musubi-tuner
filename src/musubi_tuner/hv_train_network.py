@@ -341,21 +341,70 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, timesteps, device, dtype):
-    """Computes loss weighting scheme for SD3 training.
+    """Computes loss weighting scheme for SD3 training."""
+    
+    # --- TRUTH SERUM: CHECK MAPPING ONCE ---
+    # if not hasattr(compute_loss_weighting_for_sd3, "_checked_limits"):
+    #     compute_loss_weighting_for_sd3._checked_limits = True
+        
+    #     test_ts = torch.tensor([0, 1000], device=device).long()
+    #     try:
+    #         test_sigmas = get_sigmas(noise_scheduler, test_ts, device, n_dim=1, dtype=dtype)
+            
+    #         s0 = test_sigmas[0].item()
+    #         s1000 = test_sigmas[1].item()
+            
+    #         print(f"\n{'='*40}")
+    #         print(f"[DEBUG] SCHEDULER MAPPING CHECK")
+    #         print(f"{'='*40}")
+    #         print(f"  Timestep 0    => Sigma {s0:.4f}")
+    #         print(f"  Timestep 1000 => Sigma {s1000:.4f}")
+    #         print(f"{'-'*40}")
+            
+    #         if s1000 > s0:
+    #             print(f"  CONCLUSION: 1000 is NOISE (Structure).")
+    #             print(f"              0    is CLEAN (Details).")
+    #         else:
+    #             print(f"  CONCLUSION: 0    is NOISE (Structure).")
+    #             print(f"              1000 is CLEAN (Details).")
+    #         print(f"{'='*40}\n")
+            
+    #     except Exception as e:
+    #         print(f"\n[DEBUG] Could not verify scheduler limits: {e}\n")
 
-    Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
+    if weighting_scheme not in ["sigma_sqrt", "cosmap", "structure_bell"]:
+        return None
 
-    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
-    """
-    if weighting_scheme == "sigma_sqrt" or weighting_scheme == "cosmap":
-        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
-        if weighting_scheme == "sigma_sqrt":
-            weighting = (sigmas**-2.0).float()
-        else:
-            bot = 1 - 2 * sigmas + 2 * sigmas**2
-            weighting = 2 / (math.pi * bot)
-    else:
-        weighting = None  # torch.ones_like(sigmas)
+    # This retrieves the actual noise amount (0.0=Clean, 1.0=Noise)
+    sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
+    
+    if weighting_scheme == "sigma_sqrt":
+        weighting = (sigmas**-2.0).float()
+        
+    elif weighting_scheme == "cosmap":
+        bot = 1 - 2 * sigmas + 2 * sigmas**2
+        weighting = 2 / (math.pi * bot)
+
+    elif weighting_scheme == "structure_bell":
+        # --- STRUCTURE FOCUS (Balanced Avg 1.0) ---
+        # Goal: Prioritize learning Composition (High/Mid Noise) over Fine Details (Clean).
+        #
+        # Mapping (based on sigmas):
+        # Sigma 0.0 (Clean Image) -> Weight 0.5 (Low priority)
+        # Sigma 0.5 (Mid Concepts) -> Weight 1.4 (Max priority)
+        # Sigma 1.0 (Pure Noise)  -> Weight 1.1 (High priority)
+        #
+        # Formula: y = -2.4x^2 + 3.0x + 0.5
+        # The integral is 1.2, so we scale by 0.8333 to keep the math neutral (Avg 1.0).
+        
+        t = sigmas
+        
+        # 1. Calculate Raw Curve
+        raw_weights = -2.4 * (t**2) + 3.0 * t + 0.5
+        
+        # 2. Normalize to Avg 1.0
+        weighting = raw_weights * 0.833333
+
     return weighting
 
 
@@ -2736,7 +2785,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--weighting_scheme",
         type=str,
         default="none",
-        choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"],
+        choices=["logit_normal", "structure_bell", "mode", "cosmap", "sigma_sqrt", "none"],
         help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
     )
     parser.add_argument(
