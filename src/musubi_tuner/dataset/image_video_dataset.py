@@ -1186,6 +1186,7 @@ class ImageTarDatasource(ImageDatasource):
                 subheader = initial_data[8:12].hex()
                 print(f"This file contained these bytes: {header}")
                 print(f"This file contained these bytes: {subheader}")
+                print(f"Nmae: {image_key}")
 
         _, caption = self.get_caption(idx)
 
