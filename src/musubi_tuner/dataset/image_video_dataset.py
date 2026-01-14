@@ -1183,7 +1183,7 @@ class ImageTarDatasource(ImageDatasource):
                 image = Image.open(image_bytes).convert("RGB")
             except Exception as e:
                 header = initial_data[:4].hex()
-                 print(f"This file contained these bytes: {header}")
+                print(f"This file contained these bytes: {header}")
 
         _, caption = self.get_caption(idx)
 
