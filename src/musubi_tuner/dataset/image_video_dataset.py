@@ -9,6 +9,7 @@ import random
 import tarfile
 import time
 from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+import threading
 
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
@@ -1110,6 +1111,7 @@ class ImageTarDatasource(ImageDatasource):
         self.image_tar_file = image_tar_file
         self.caption_extension = caption_extension
         self.current_idx = 0
+        self.tar_lock = threading.RLock()  # CRITICAL: Lock for thread safety
 
         logger.info(f"opening data source: {self.image_tar_file}")
 
@@ -1124,15 +1126,14 @@ class ImageTarDatasource(ImageDatasource):
                 decrypted_data = gpg.decrypt_file(f, passphrase=dataset_passphrase)
                 if not decrypted_data.ok:
                     raise RuntimeError(f"Failed to decrypt file: {decrypted_data.status}")
-                # Decrypted data is in memory, wrap it in a file-like object
                 decrypted_stream = io.BytesIO(decrypted_data.data)
             self.tar_file = tarfile.open(fileobj=decrypted_stream, mode="r:gz")
         else:
             self.tar_file = tarfile.open(self.image_tar_file, "r:gz")
 
-        # Build an index of files
+        # Build index
         self.image_members = []
-        caption_map = {}  # basename -> member
+        caption_map = {}
         all_members = self.tar_file.getmembers()
 
         for member in all_members:
@@ -1150,7 +1151,6 @@ class ImageTarDatasource(ImageDatasource):
 
         self.image_members.sort(key=lambda m: m.name)
 
-        # Create a map from image member to caption member
         self.caption_members = {}
         for img_member in self.image_members:
             img_basename = os.path.basename(os.path.splitext(img_member.name)[0])
@@ -1158,8 +1158,6 @@ class ImageTarDatasource(ImageDatasource):
                 self.caption_members[img_member.name] = caption_map[img_basename]
 
         logger.info(f"found {len(self.image_members)} images in data source")
-
-        # Control images are not supported in tar files for now.
         self.has_control = False
 
     def is_indexable(self):
@@ -1172,25 +1170,35 @@ class ImageTarDatasource(ImageDatasource):
         image_member = self.image_members[idx]
         image_key = image_member.name
 
-        extracted_file = self.tar_file.extractfile(image_member)
-        if extracted_file is None:
+        # CRITICAL: Lock the extraction to prevent race conditions on the file pointer
+        # We read bytes into memory immediately, then release the lock.
+        # Image processing happens OUTSIDE the lock to maintain concurrency.
+        initial_data = None
+        try:
+            with self.tar_lock:
+                extracted_file = self.tar_file.extractfile(image_member)
+                if extracted_file is not None:
+                    initial_data = extracted_file.read()
+        except Exception as e:
+            logger.error(f"Error reading tar member {image_key}: {e}")
+            raise IOError(f"Could not read tar member: {image_key}") from e
+
+        if initial_data is None:
             raise IOError(f"Could not extract file from tar: {image_key}")
-        with extracted_file as f:
-            initial_data = f.read()
-            image_bytes = io.BytesIO(initial_data)
-            image_bytes.seek(0)
-            try:
-                image = Image.open(image_bytes).convert("RGB")
-            except Exception as e:
-                header = initial_data[:4].hex()
-                subheader = initial_data[8:12].hex()
-                print(f"This file contained these bytes: {header}")
-                print(f"This file contained these bytes: {subheader}")
-                print(f"Nmae: {image_key}")
+
+        image_bytes = io.BytesIO(initial_data)
+        image_bytes.seek(0)
+        
+        try:
+            image = Image.open(image_bytes).convert("RGB")
+            # Force loading data now while we have the BytesIO context
+            image.load() 
+        except Exception as e:
+            logger.error(f"Failed to identify/load image {image_key}. Error: {e}")
+            # Raising specific error helps debugging
+            raise
 
         _, caption = self.get_caption(idx)
-
-        # No controls for tar files.
         controls = None
 
         return image_key, image, caption, controls
@@ -1202,12 +1210,18 @@ class ImageTarDatasource(ImageDatasource):
         caption = ""
         if image_key in self.caption_members:
             caption_member = self.caption_members[image_key]
-            extracted_file = self.tar_file.extractfile(caption_member)
-            if extracted_file is None:
+            
+            # CRITICAL: Lock here as well
+            content = None
+            with self.tar_lock:
+                extracted_file = self.tar_file.extractfile(caption_member)
+                if extracted_file is not None:
+                    content = extracted_file.read()
+            
+            if content is not None:
+                caption = content.decode("utf-8").strip()
+            else:
                 logger.warning(f"Could not extract caption file from tar: {caption_member.name}")
-                return image_key, ""
-            with extracted_file as f:
-                caption = f.read().decode("utf-8").strip()
 
         return image_key, caption
 
