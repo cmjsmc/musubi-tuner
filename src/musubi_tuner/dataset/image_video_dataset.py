@@ -1176,9 +1176,14 @@ class ImageTarDatasource(ImageDatasource):
         if extracted_file is None:
             raise IOError(f"Could not extract file from tar: {image_key}")
         with extracted_file as f:
-            image_bytes = io.BytesIO(f.read())
+            initial_data = f.read()
+            image_bytes = io.BytesIO(initial_data)
             image_bytes.seek(0)
-            image = Image.open(image_bytes).convert("RGB")
+            try:
+                image = Image.open(image_bytes).convert("RGB")
+            except Exception as e:
+                header = initial_data[:4].hex()
+                 print(f"This file contained these bytes: {header}")
 
         _, caption = self.get_caption(idx)
 
