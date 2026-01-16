@@ -327,9 +327,8 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
     # if sum([(schedule_timesteps == t) for t in timesteps]) < len(timesteps):
     if any([(schedule_timesteps == t).sum() == 0 for t in timesteps]):
-        # raise ValueError("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         # round to nearest timestep
-        logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
+        # logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
     else:
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
@@ -1232,7 +1231,7 @@ class NetworkTrainer:
             torch.cuda.seed()
             generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
 
-        logger.info(f"prompt: {prompt}")
+        # logger.info(f"prompt: {prompt}")
         logger.info(f"height: {height}")
         logger.info(f"width: {width}")
         logger.info(f"frame count: {frame_count}")
@@ -1245,7 +1244,7 @@ class NetworkTrainer:
         do_classifier_free_guidance = False
         if negative_prompt is not None:
             do_classifier_free_guidance = True
-            logger.info(f"negative prompt: {negative_prompt}")
+            # logger.info(f"negative prompt: {negative_prompt}")
             logger.info(f"cfg scale: {cfg_scale}")
 
         if self.i2v_training:
@@ -1369,7 +1368,7 @@ class NetworkTrainer:
     ):
         text_encoder1, text_encoder2, fp8_llm = args.text_encoder1, args.text_encoder2, args.fp8_llm
 
-        logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
+        # logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
 
         def encode_for_text_encoder(text_encoder, is_llm=True):
@@ -1380,7 +1379,7 @@ class NetworkTrainer:
                         if p is None:
                             continue
                         if p not in sample_prompts_te_outputs:
-                            logger.info(f"cache Text Encoder outputs for prompt: {p}")
+                            # logger.info(f"cache Text Encoder outputs for prompt: {p}")
 
                             data_type = "video"
                             text_inputs = text_encoder.text2tokens(p, data_type=data_type)
