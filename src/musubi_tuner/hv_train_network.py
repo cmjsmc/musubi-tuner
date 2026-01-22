@@ -351,14 +351,14 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
         return None
 
     # This retrieves the actual noise amount (0.0=Clean, 1.0=Noise)
-        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
+    sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
 
-        if weighting_scheme == "sigma_sqrt":
+    if weighting_scheme == "sigma_sqrt":
         weighting = (sigmas ** -2.0).float()
 
     elif weighting_scheme == "cosmap":
         bot = 1 - 2 * sigmas + 2 * sigmas ** 2
-            weighting = 2 / (math.pi * bot)
+        weighting = 2 / (math.pi * bot)
 
     elif weighting_scheme == "structure_bell":
         # --- STRUCTURE FOCUS (Balanced Avg 1.0) ---
