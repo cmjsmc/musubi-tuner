@@ -489,11 +489,11 @@ def load_flow_model(
 
     # build model
     with init_empty_weights():
-        params = flux2_models.configs_flux_2_dev.params
-
+        if model_version == "flux.2-dev":
+            params = flux2_models.configs_flux_2_dev.params
+        else:
+            params = FLUX2_MODEL_INFO[model_version]["params"]
         model = flux2_models.Flux2(params, attn_mode, split_attn)
-        if dtype is not None:
-            model = model.to(dtype)
 
     # load_sft doesn't support torch.device
     logger.info(f"Loading state dict from {ckpt_path} to {flux_2_loading_device}")
