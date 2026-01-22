@@ -872,7 +872,7 @@ def load_textembedder(
     else:
         variant = FLUX2_MODEL_INFO[model_version]["qwen_variant"]
         return Qwen3Embedder(
-            f"Qwen/Qwen3-{variant}-FP8",
+            f"Qwen/Qwen3-{variant}",
             ckpt_path,
             dtype,
             device,
