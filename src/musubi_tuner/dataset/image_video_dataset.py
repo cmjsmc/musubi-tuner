@@ -2167,7 +2167,7 @@ class ImageDataset(BaseDataset):
             self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
         elif image_tar_file is not None:
             self.datasource = ImageTarDatasource(image_tar_file, caption_extension, control_directory,
-                                                 control_count_per_image, dataset_passphrase)
+                                                 control_count_per_image, multiple_target, dataset_passphrase)
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
