@@ -49,12 +49,14 @@ class ImageDatasetParams(BaseDatasetParams):
     image_jsonl_file: Optional[str] = None
     image_tar_file: Optional[str] = None
     control_directory: Optional[str] = None
+    multiple_target: Optional[bool] = False
 
     # FramePack dependent parameters
     fp_latent_window_size: Optional[int] = 9
     fp_1f_clean_indices: Optional[Sequence[int]] = None
     fp_1f_target_index: Optional[int] = None
     fp_1f_no_post: Optional[bool] = False
+
     flux_kontext_no_resize_control: Optional[bool] = False  # if True, control images are not resized to target resolution
     qwen_image_edit_no_resize_control: Optional[bool] = False  # if True, control images are not resized to target resolution
     qwen_image_edit_control_resolution: Optional[Tuple[int, int]] = None  # if set, control images are resized to this resolution
@@ -126,6 +128,7 @@ class ConfigSanitizer:
         "image_tar_file": str,
         "cache_directory": str,
         "control_directory": str,
+        "multiple_target": bool,
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
         "fp_1f_target_index": int,
@@ -242,7 +245,7 @@ class BlueprintGenerator:
                 dataset_params_klass = VideoDatasetParams
 
             params = self.generate_params_by_fallbacks(
-                dataset_params_klass, [argparse_config, dataset_config, general_config, runtime_params]
+                dataset_params_klass, [dataset_config, general_config, argparse_config, runtime_params]
             )
             dataset_blueprints.append(DatasetBlueprint(is_image_dataset, params))
 
@@ -323,6 +326,8 @@ def generate_dataset_group_by_blueprint(
                     f"""\
         image_directory: "{dataset.image_directory}"
         image_jsonl_file: "{dataset.image_jsonl_file}"
+        control_directory: "{dataset.control_directory}"
+        multiple_target: {dataset.multiple_target}
         image_tar_file: "{getattr(dataset, 'image_tar_file', None)}"
         fp_latent_window_size: {dataset.fp_latent_window_size}
         fp_1f_clean_indices: {dataset.fp_1f_clean_indices}
