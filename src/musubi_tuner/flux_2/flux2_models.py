@@ -10,8 +10,6 @@ from typing import Optional
 from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
-# from musubi_tuner.hunyuan_model.attention import attention as hunyuan_attention
-
 from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 # import logging
@@ -80,6 +78,13 @@ class AutoEncoderParams:
 
 def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
+
+
+def clamp_fp16(x: Tensor) -> Tensor:
+    """Clamps float16 values to safe range to avoid overflow, handling NaNs."""
+    if x.dtype == torch.float16:
+        return torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
+    return x
 
 
 class AttnBlock(nn.Module):
@@ -720,7 +725,10 @@ class SiLUActivation(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x1, x2 = x.chunk(2, dim=-1)
-        return self.gate_fn(x1) * x2
+        # Apply fp16 downscale logic similar to Z-Image
+        if x.dtype == torch.float16:
+            x2 = x2 / 32.0
+        return clamp_fp16(self.gate_fn(x1) * x2)
 
 
 class Modulation(nn.Module):
@@ -828,8 +836,17 @@ class SingleStreamBlock(nn.Module):
 
         attn = attention(q, k, v, pe, attn_mode=self.attn_mode, split_attn=self.split_attn)
 
+        # Scale attention output for FP16 stability
+        if attn.dtype == torch.float16:
+            attn = attn / 4.0
+
         # compute activation in mlp stream, cat again and run second linear layer
+        # mlp_act automatically handles scaling and clamping
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        
+        # Clamp final output
+        output = clamp_fp16(output)
+
         return x + mod_gate * output
 
     def forward(
@@ -949,13 +966,26 @@ class DoubleStreamBlock(nn.Module):
         attn = attention(q, k, v, pe, attn_mode=self.attn_mode, split_attn=self.split_attn)
         txt_attn, img_attn = attn[:, : txt_q.shape[2]], attn[:, txt_q.shape[2] :]
 
-        # calculate the img blocks
-        img = img + img_mod1_gate * self.img_attn.proj(img_attn)
-        img = img + img_mod2_gate * self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift)
+        # calculate the img blocks with stability patches
+        img_attn_out = self.img_attn.proj(img_attn)
+        if img_attn_out.dtype == torch.float16:
+            img_attn_out = img_attn_out / 4.0
+        
+        img = img + img_mod1_gate * clamp_fp16(img_attn_out)
 
-        # calculate the txt blocks
-        txt = txt + txt_mod1_gate * self.txt_attn.proj(txt_attn)
-        txt = txt + txt_mod2_gate * self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift)
+        img_mlp_out = self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift)
+        img = img + img_mod2_gate * clamp_fp16(img_mlp_out)
+
+        # calculate the txt blocks with stability patches
+        txt_attn_out = self.txt_attn.proj(txt_attn)
+        if txt_attn_out.dtype == torch.float16:
+            txt_attn_out = txt_attn_out / 4.0
+
+        txt = txt + txt_mod1_gate * clamp_fp16(txt_attn_out)
+        
+        txt_mlp_out = self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift)
+        txt = txt + txt_mod2_gate * clamp_fp16(txt_mlp_out)
+        
         return img, txt
 
     def forward(
