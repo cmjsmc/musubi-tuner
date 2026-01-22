@@ -142,9 +142,11 @@ def load_flow_model(
 
     # build model
     with init_empty_weights():
-        params = flux_models.configs_flux_dev_context.params
-
-        model = flux_models.Flux(params, attn_mode, split_attn)
+        if model_version == "flux.2-dev":
+          params = flux2_models.configs_flux_2_dev.params
+        else:
+          params = FLUX2_MODEL_INFO[model_version]["params"]
+        model = flux2_models.Flux2(params, attn_mode, split_attn)
         if dtype is not None:
             model = model.to(dtype)
 
