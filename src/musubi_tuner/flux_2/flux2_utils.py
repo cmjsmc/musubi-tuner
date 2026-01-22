@@ -479,6 +479,7 @@ def load_flow_model(
     split_attn: bool = False,
     loading_device: Optional[Union[str, torch.device]] = None,
     fp8_scaled: bool = False,
+    model_version: str = "flux.2-dev",
 ) -> flux2_models.Flux2:
     if loading_device is None:
         loading_device = device
