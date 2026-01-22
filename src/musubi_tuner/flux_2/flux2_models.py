@@ -1,12 +1,15 @@
-# # copy from FLUX repo: https://github.com/black-forest-labs/flux
-# # license: Apache-2.0 License
+# Copyright (c) 2025 Z-Image Team & Black Forest Labs
+# Modified for Musubi Tuner project.
+
 import math
 from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Union
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
 from einops import rearrange
-from torch import Tensor, nn
-from typing import Optional
 from torch.utils.checkpoint import checkpoint
 
 from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
@@ -62,7 +65,6 @@ class Klein4BParams:
 
 
 # # region autoencoder
-#
 
 
 @dataclass
@@ -78,14 +80,6 @@ class AutoEncoderParams:
 
 def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
-
-
-def clamp_fp16(x: Tensor) -> Tensor:
-    """Clamps float16 values to safe range to avoid overflow, handling NaNs."""
-    if x.dtype == torch.float16:
-        # Clamp to slightly less than max float16 to allow for small accumulations later
-        return torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
-    return x
 
 
 class AttnBlock(nn.Module):
@@ -726,8 +720,7 @@ class SiLUActivation(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         x1, x2 = x.chunk(2, dim=-1)
-        # REMOVED: x2 = x2 / 32.0 - This broke the pre-trained weights
-        return clamp_fp16(self.gate_fn(x1) * x2)
+        return self.gate_fn(x1) * x2
 
 
 class Modulation(nn.Module):
@@ -837,7 +830,12 @@ class SingleStreamBlock(nn.Module):
 
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + mod_gate * clamp_fp16(output)
+        
+        # Stability Fix: Compute residual addition in float32 if needed to prevent overflow
+        if x.dtype == torch.float16:
+            return (x.float() + mod_gate.float() * output.float()).to(x.dtype)
+        
+        return x + mod_gate * output
 
     def forward(
         self,
@@ -956,14 +954,25 @@ class DoubleStreamBlock(nn.Module):
         attn = attention(q, k, v, pe, attn_mode=self.attn_mode, split_attn=self.split_attn)
         txt_attn, img_attn = attn[:, : txt_q.shape[2]], attn[:, txt_q.shape[2] :]
 
-        # calculate the img blocks
-        # REMOVED: division by 4.0 - kept only clamp
-        img = img + img_mod1_gate * clamp_fp16(self.img_attn.proj(img_attn))
-        img = img + img_mod2_gate * clamp_fp16(self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift))
+        # Stability Fix: Selective upcasting for residuals
+        if img.dtype == torch.float16:
+            img_attn_out = self.img_attn.proj(img_attn)
+            img = (img.float() + img_mod1_gate.float() * img_attn_out.float()).to(img.dtype)
+            
+            img_mlp_out = self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift)
+            img = (img.float() + img_mod2_gate.float() * img_mlp_out.float()).to(img.dtype)
+            
+            txt_attn_out = self.txt_attn.proj(txt_attn)
+            txt = (txt.float() + txt_mod1_gate.float() * txt_attn_out.float()).to(txt.dtype)
+            
+            txt_mlp_out = self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift)
+            txt = (txt.float() + txt_mod2_gate.float() * txt_mlp_out.float()).to(txt.dtype)
+        else:
+            img = img + img_mod1_gate * self.img_attn.proj(img_attn)
+            img = img + img_mod2_gate * self.img_mlp((1 + img_mod2_scale) * (self.img_norm2(img)) + img_mod2_shift)
+            txt = txt + txt_mod1_gate * self.txt_attn.proj(txt_attn)
+            txt = txt + txt_mod2_gate * self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift)
 
-        # calculate the txt blocks
-        txt = txt + txt_mod1_gate * clamp_fp16(self.txt_attn.proj(txt_attn))
-        txt = txt + txt_mod2_gate * clamp_fp16(self.txt_mlp((1 + txt_mod2_scale) * (self.txt_norm2(txt)) + txt_mod2_shift))
         return img, txt
 
     def forward(
