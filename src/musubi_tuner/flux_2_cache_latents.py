@@ -17,7 +17,7 @@ from musubi_tuner.flux_2 import flux2_models
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def preprocess_contents_flux_2(batch: List[ItemInfo]) -> tuple[torch.Tensor, List[List[np.ndarray]]]:
