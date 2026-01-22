@@ -55,7 +55,6 @@ from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
 SS_METADATA_KEY_NETWORK_MODULE = "ss_network_module"
 SS_METADATA_KEY_NETWORK_DIM = "ss_network_dim"
@@ -300,7 +299,8 @@ def load_prompts(prompt_file: str) -> list[Dict]:
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+        weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None,
+        mode_scale: float = None
 ):
     """Compute the density for sampling the timesteps when doing SD3 training.
 
@@ -327,6 +327,7 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
     # if sum([(schedule_timesteps == t) for t in timesteps]) < len(timesteps):
     if any([(schedule_timesteps == t).sum() == 0 for t in timesteps]):
+        # raise ValueError("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         # round to nearest timestep
         # logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
@@ -340,49 +341,24 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, timesteps, device, dtype):
-    """Computes loss weighting scheme for SD3 training."""
-    
-    # --- TRUTH SERUM: CHECK MAPPING ONCE ---
-    # if not hasattr(compute_loss_weighting_for_sd3, "_checked_limits"):
-    #     compute_loss_weighting_for_sd3._checked_limits = True
-        
-    #     test_ts = torch.tensor([0, 1000], device=device).long()
-    #     try:
-    #         test_sigmas = get_sigmas(noise_scheduler, test_ts, device, n_dim=1, dtype=dtype)
-            
-    #         s0 = test_sigmas[0].item()
-    #         s1000 = test_sigmas[1].item()
-            
-    #         print(f"\n{'='*40}")
-    #         print(f"[DEBUG] SCHEDULER MAPPING CHECK")
-    #         print(f"{'='*40}")
-    #         print(f"  Timestep 0    => Sigma {s0:.4f}")
-    #         print(f"  Timestep 1000 => Sigma {s1000:.4f}")
-    #         print(f"{'-'*40}")
-            
-    #         if s1000 > s0:
-    #             print(f"  CONCLUSION: 1000 is NOISE (Structure).")
-    #             print(f"              0    is CLEAN (Details).")
-    #         else:
-    #             print(f"  CONCLUSION: 0    is NOISE (Structure).")
-    #             print(f"              1000 is CLEAN (Details).")
-    #         print(f"{'='*40}\n")
-            
-    #     except Exception as e:
-    #         print(f"\n[DEBUG] Could not verify scheduler limits: {e}\n")
+    """Computes loss weighting scheme for SD3 training.
 
+    Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
+
+    SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+    """
     if weighting_scheme not in ["sigma_sqrt", "cosmap", "structure_bell"]:
         return None
 
     # This retrieves the actual noise amount (0.0=Clean, 1.0=Noise)
-    sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
-    
-    if weighting_scheme == "sigma_sqrt":
-        weighting = (sigmas**-2.0).float()
-        
+        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
+
+        if weighting_scheme == "sigma_sqrt":
+        weighting = (sigmas ** -2.0).float()
+
     elif weighting_scheme == "cosmap":
-        bot = 1 - 2 * sigmas + 2 * sigmas**2
-        weighting = 2 / (math.pi * bot)
+        bot = 1 - 2 * sigmas + 2 * sigmas ** 2
+            weighting = 2 / (math.pi * bot)
 
     elif weighting_scheme == "structure_bell":
         # --- STRUCTURE FOCUS (Balanced Avg 1.0) ---
@@ -395,12 +371,12 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
         #
         # Formula: y = -2.4x^2 + 3.0x + 0.5
         # The integral is 1.2, so we scale by 0.8333 to keep the math neutral (Avg 1.0).
-        
+
         t = sigmas
-        
+
         # 1. Calculate Raw Curve
-        raw_weights = -2.4 * (t**2) + 3.0 * t + 0.5
-        
+        raw_weights = -2.4 * (t ** 2) + 3.0 * t + 0.5
+
         # 2. Normalize to Avg 1.0
         weighting = raw_weights * 0.833333
 
@@ -426,6 +402,7 @@ class NetworkTrainer:
         self.blocks_to_swap = None
         self.timestep_range_pool = []
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
+        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -870,6 +847,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "logsnr"
             or args.timestep_sampling == "qinglong_flux"
             or args.timestep_sampling == "qinglong_qwen"
+            or args.timestep_sampling == "flux2_shift"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -905,6 +883,8 @@ class NetworkTrainer:
                         # we are pre-packed so must adjust for packed size
                         if args.timestep_sampling == "flux_shift":
                             mu = train_utils.get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+                        elif args.timestep_sampling == "flux2_shift":
+                            mu = train_utils.get_lin_function(y1=0.5, y2=1.15)(h * w)
                         elif args.timestep_sampling == "qwen_shift":
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)((h // 2) * (w // 2))
                         # def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -1096,11 +1076,11 @@ class NetworkTrainer:
             plt.tight_layout()
 
             output_path = Path("timesteps_analysis.png")
-            plt.savefig(output_path, dpi=300) 
+            plt.savefig(output_path, dpi=300)
             print(f"Plot successfully saved to: {output_path.resolve()}")
-            
+
             plt.show()
-            plt.close() 
+            plt.close()
 
         else:
             sampled_timesteps = np.array(sampled_timesteps)
@@ -1200,7 +1180,8 @@ class NetworkTrainer:
         width = (width // 8) * 8
         height = (height // 8) * 8
 
-        frame_count = (frame_count - 1) // 4 * 4 + 1  # 1, 5, 9, 13, ... For HunyuanVideo and Wan2.1
+        # 1, 5, 9, 13, ... For HunyuanVideo and Wan2.1
+        frame_count = (frame_count - 1) // self.vae_frame_stride * self.vae_frame_stride + 1
 
         if self.i2v_training:
             image_path = sample_parameter.get("image_path", None)
@@ -1307,7 +1288,8 @@ class NetworkTrainer:
             wandb = None
 
         if video.shape[2] == 1:
-            image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
+            # In Qwen-Image-Layered, video is (N, C, 1, H, W) where N=Layers, otherwise (1, C, 1, H, W)
+            image_paths = save_images_grid(video, save_dir, save_path, n_rows=video.shape[0], create_subdir=False)
             if wandb_tracker is not None and wandb is not None:
                 for image_path in image_paths:
                     wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
@@ -2763,7 +2745,18 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"],
+        choices=[
+            "sigma",
+            "uniform",
+            "sigmoid",
+            "shift",
+            "flux_shift",
+            "flux2_shift",
+            "qwen_shift",
+            "logsnr",
+            "qinglong_flux",
+            "qinglong_qwen",
+        ],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and flux shift."
         " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、flux shift。",
