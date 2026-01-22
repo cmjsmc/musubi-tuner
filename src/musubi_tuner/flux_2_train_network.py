@@ -226,6 +226,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
         split_attn: bool,
         loading_device: str,
         dit_weight_dtype: Optional[torch.dtype],
+        args: argparse.Namespace,
     ):
         model = flux2_utils.load_flow_model(
             ckpt_path=args.dit,
@@ -236,6 +237,7 @@ class Flux2NetworkTrainer(NetworkTrainer):
             split_attn=split_attn,
             loading_device=loading_device,
             fp8_scaled=args.fp8_scaled,
+            model_version=args.model_version,
         )
         return model
 
