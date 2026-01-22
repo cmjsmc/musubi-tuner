@@ -778,8 +778,8 @@ class Qwen3Embedder(nn.Module):
         super().__init__()
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_spec,
-            torch_dtype=None,
+            ckpt_path,
+            torch_dtype=bfloat16,
             device_map=str(device),
         )
 
