@@ -67,7 +67,7 @@ def main():
     all_cache_files_for_dataset, all_cache_paths_for_dataset = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
     # Load Mistral 3 text encoder
-    m3_dtype = torch.float8e4m3fn if args.fp8_m3 else torch.bfloat16
+    m3_dtype = torch.float8_e4m3fn if args.fp8_m3 else torch.bfloat16
     text_embedder = flux2_utils.load_textembedder(
         args.model_version,
         args.text_encoder,
