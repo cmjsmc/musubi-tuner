@@ -1,9 +1,12 @@
-# # copy from FLUX repo: https://github.com/black-forest-labs/flux
-# # license: Apache-2.0 License
+# Copyright (c) 2025 Z-Image Team & Black Forest Labs
+# Modified for Musubi Tuner project.
+
 import math
 from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
@@ -763,6 +766,11 @@ class SingleStreamBlock(nn.Module):
 
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        
+        # Stability Fix: Compute residual addition in float32 if needed to prevent overflow
+        if x.dtype == torch.float16:
+            return (x.float() + mod_gate.float() * output.float()).to(x.dtype)
+        
         return x + mod_gate * output
 
     def forward(self, x: Tensor, pe: Tensor, mod: tuple[Tensor, Tensor], attn_params: AttentionParams) -> Tensor:

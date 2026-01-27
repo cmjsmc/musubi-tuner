@@ -7,6 +7,7 @@ import argparse
 import math
 import os
 import pathlib
+from pathlib import Path
 import re
 import sys
 import random
@@ -53,7 +54,6 @@ from musubi_tuner.utils import huggingface_utils, model_utils, train_utils, sai_
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
 
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
 SS_METADATA_KEY_NETWORK_MODULE = "ss_network_module"
@@ -299,7 +299,8 @@ def load_prompts(prompt_file: str) -> list[Dict]:
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+        weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None,
+        mode_scale: float = None
 ):
     """Compute the density for sampling the timesteps when doing SD3 training.
 
@@ -328,7 +329,7 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
     if any([(schedule_timesteps == t).sum() == 0 for t in timesteps]):
         # raise ValueError("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         # round to nearest timestep
-        logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
+        # logger.warning("Some timesteps are not in the schedule / 一部のtimestepsがスケジュールに含まれていません")
         step_indices = [torch.argmin(torch.abs(schedule_timesteps - t)).item() for t in timesteps]
     else:
         step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
@@ -346,15 +347,39 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
 
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
     """
-    if weighting_scheme == "sigma_sqrt" or weighting_scheme == "cosmap":
-        sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
-        if weighting_scheme == "sigma_sqrt":
-            weighting = (sigmas**-2.0).float()
-        else:
-            bot = 1 - 2 * sigmas + 2 * sigmas**2
-            weighting = 2 / (math.pi * bot)
-    else:
-        weighting = None  # torch.ones_like(sigmas)
+    if weighting_scheme not in ["sigma_sqrt", "cosmap", "structure_bell"]:
+        return None
+
+    # This retrieves the actual noise amount (0.0=Clean, 1.0=Noise)
+    sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
+
+    if weighting_scheme == "sigma_sqrt":
+        weighting = (sigmas ** -2.0).float()
+
+    elif weighting_scheme == "cosmap":
+        bot = 1 - 2 * sigmas + 2 * sigmas ** 2
+        weighting = 2 / (math.pi * bot)
+
+    elif weighting_scheme == "structure_bell":
+        # --- STRUCTURE FOCUS (Balanced Avg 1.0) ---
+        # Goal: Prioritize learning Composition (High/Mid Noise) over Fine Details (Clean).
+        #
+        # Mapping (based on sigmas):
+        # Sigma 0.0 (Clean Image) -> Weight 0.5 (Low priority)
+        # Sigma 0.5 (Mid Concepts) -> Weight 1.4 (Max priority)
+        # Sigma 1.0 (Pure Noise)  -> Weight 1.1 (High priority)
+        #
+        # Formula: y = -2.4x^2 + 3.0x + 0.5
+        # The integral is 1.2, so we scale by 0.8333 to keep the math neutral (Avg 1.0).
+
+        t = sigmas
+
+        # 1. Calculate Raw Curve
+        raw_weights = -2.4 * (t ** 2) + 3.0 * t + 0.5
+
+        # 2. Normalize to Avg 1.0
+        weighting = raw_weights * 0.833333
+
     return weighting
 
 
@@ -1050,7 +1075,13 @@ class NetworkTrainer:
             plt.ylabel("Weighting")
 
             plt.tight_layout()
+
+            output_path = Path("timesteps_analysis.png")
+            plt.savefig(output_path, dpi=300)
+            print(f"Plot successfully saved to: {output_path.resolve()}")
+
             plt.show()
+            plt.close()
 
         else:
             sampled_timesteps = np.array(sampled_timesteps)
@@ -1182,7 +1213,7 @@ class NetworkTrainer:
             torch.cuda.seed()
             generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
 
-        logger.info(f"prompt: {prompt}")
+        # logger.info(f"prompt: {prompt}")
         logger.info(f"height: {height}")
         logger.info(f"width: {width}")
         logger.info(f"frame count: {frame_count}")
@@ -1195,7 +1226,7 @@ class NetworkTrainer:
         do_classifier_free_guidance = False
         if negative_prompt is not None:
             do_classifier_free_guidance = True
-            logger.info(f"negative prompt: {negative_prompt}")
+            # logger.info(f"negative prompt: {negative_prompt}")
             logger.info(f"cfg scale: {cfg_scale}")
 
         if self.i2v_training:
@@ -1320,7 +1351,7 @@ class NetworkTrainer:
     ):
         text_encoder1, text_encoder2, fp8_llm = args.text_encoder1, args.text_encoder2, args.fp8_llm
 
-        logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
+        # logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
 
         def encode_for_text_encoder(text_encoder, is_llm=True):
@@ -1331,7 +1362,7 @@ class NetworkTrainer:
                         if p is None:
                             continue
                         if p not in sample_prompts_te_outputs:
-                            logger.info(f"cache Text Encoder outputs for prompt: {p}")
+                            # logger.info(f"cache Text Encoder outputs for prompt: {p}")
 
                             data_type = "video"
                             text_inputs = text_encoder.text2tokens(p, data_type=data_type)
@@ -2364,6 +2395,12 @@ def setup_parser_common() -> argparse.ArgumentParser:
         default=None,
         help="config file for dataset / データセットの設定ファイル",
     )
+    parser.add_argument(
+        "--dataset_passphrase",
+        type=str,
+        default=None,
+        help="passphrase for encrypted dataset archives (.tar.gz.gpg) / 暗号化されたデータセットアーカイブのパスフレーズ",
+    )
 
     # model settings
     parser.add_argument(
@@ -2741,7 +2778,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--weighting_scheme",
         type=str,
         default="none",
-        choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"],
+        choices=["logit_normal", "structure_bell", "mode", "cosmap", "sigma_sqrt", "none"],
         help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
     )
     parser.add_argument(

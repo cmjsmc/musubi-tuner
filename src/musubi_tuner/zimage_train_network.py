@@ -20,7 +20,7 @@ from musubi_tuner.utils import model_utils
 import logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 class ZImageNetworkTrainer(NetworkTrainer):

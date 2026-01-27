@@ -21,7 +21,7 @@ import logging
 from musubi_tuner.utils import model_utils
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 class Flux2NetworkTrainer(NetworkTrainer):

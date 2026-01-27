@@ -19,7 +19,7 @@ from musubi_tuner.qwen_image import qwen_image_autoencoder_kl
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def preprocess_contents_qwen_image(batch: List[ItemInfo], is_layered: bool) -> tuple[torch.Tensor]:
@@ -122,10 +122,11 @@ def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage,
     for b, item in enumerate(batch):
         target_latent = latents[b]  # C, L, H, W. Target latents for this image (ground truth)
         control_latent = control_latents[b] if control_latents is not None else None  # list of (C, 1, H, W) or None
-        print(
-            f"Saving cache for item {item.item_key} at {item.latent_cache_path}, target latents shape: {target_latent.shape}, "
-            f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}"
-        )
+        
+        # print(
+        #     f"Saving cache for item {item.item_key} at {item.latent_cache_path}, target latents shape: {target_latent.shape}, "
+        #     f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}"
+        # )
 
         save_latent_cache_qwen_image(item_info=item, latent=target_latent, control_latent=control_latent)
 

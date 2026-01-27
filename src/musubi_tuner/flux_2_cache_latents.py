@@ -13,7 +13,7 @@ import musubi_tuner.cache_latents as cache_latents
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def preprocess_contents_flux_2(batch: List[ItemInfo]) -> tuple[torch.Tensor, List[List[np.ndarray]]]:
@@ -64,10 +64,10 @@ def encode_and_save_batch(ae: flux2_models.AutoEncoder, batch: List[ItemInfo], a
         target_latent = latents[b]  # C, H, W. Target latents for this image (ground truth)
         control_latent = control_latents[b] if control_latents is not None else None  # list of (C, H, W) tensors or None
 
-        print(
-            f"Saving cache for item {item.item_key} at {item.latent_cache_path}, target latents shape: {target_latent.shape}, "
-            f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}"
-        )
+        # print(
+        #     f"Saving cache for item {item.item_key} at {item.latent_cache_path}, target latents shape: {target_latent.shape}, "
+        #     f"control latents shape: {[cl.shape for cl in control_latent] if control_latent is not None else None}"
+        # )
 
         # save cache (file path is inside item.latent_cache_path pattern)
         save_latent_cache_flux_2(
