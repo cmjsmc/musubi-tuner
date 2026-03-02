@@ -598,12 +598,12 @@ class Flux2(nn.Module):
     def forward(self, x: Tensor, x_ids: Tensor, timesteps: Tensor, ctx: Tensor, ctx_ids: Tensor, guidance: Tensor | None) -> Tensor:
         num_txt_tokens = ctx.shape[1]
 
-        timestep_emb = timestep_embedding(timesteps, 256)
+        timestep_emb = timestep_embedding(timesteps, 256).to(x.dtype)
         del timesteps
         vec = self.time_in(timestep_emb)
-        del timestep_emb
+        
         if self.use_guidance_embed:
-            guidance_emb = timestep_embedding(guidance, 256)
+            guidance_emb = timestep_embedding(guidance, 256).to(x.dtype)
             vec = vec + self.guidance_in(guidance_emb)
             del guidance_emb
 
@@ -688,7 +688,11 @@ class Modulation(nn.Module):
     def forward(self, vec: torch.Tensor):
         org_dtype = vec.dtype
         vec = vec.to(torch.float32)  # for numerical stability
-        out = self.lin(nn.functional.silu(vec))
+        
+        w_lin = self.lin.weight.float()
+        b_lin = self.lin.bias.float() if self.lin.bias is not None else None
+        out = F.linear(nn.functional.silu(vec), w_lin, b_lin)
+        
         if out.ndim == 2:
             out = out[:, None, :]
         out = out.to(org_dtype)
@@ -706,14 +710,24 @@ class LastLayer(nn.Module):
     def forward(self, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
         org_dtype = x.dtype
         vec = vec.to(torch.float32)  # for numerical stability
-        mod = self.adaLN_modulation(vec)
+        
+        # Unfold the sequential module to cast weights dynamically
+        w_ada = self.adaLN_modulation[1].weight.float()
+        b_ada = self.adaLN_modulation[1].bias.float() if self.adaLN_modulation[1].bias is not None else None
+        mod = F.linear(self.adaLN_modulation[0](vec), w_ada, b_ada)
+        
         shift, scale = mod.chunk(2, dim=-1)
         if shift.ndim == 2:
             shift = shift[:, None, :]
             scale = scale[:, None, :]
+            
         x = x.to(torch.float32)  # for numerical stability
         x = (1 + scale) * self.norm_final(x) + shift
-        x = self.linear(x)
+        
+        w_lin = self.linear.weight.float()
+        b_lin = self.linear.bias.float() if self.linear.bias is not None else None
+        x = F.linear(x, w_lin, b_lin)
+        
         return x.to(org_dtype)
 
 
@@ -926,7 +940,20 @@ class MLPEmbedder(nn.Module):
         self.gradient_checkpointing = False
 
     def _forward(self, x: Tensor) -> Tensor:
-        return self.out_layer(self.silu(self.in_layer(x)))
+        org_dtype = x.dtype
+        x = x.float()
+        
+        w_in = self.in_layer.weight.float()
+        b_in = self.in_layer.bias.float() if self.in_layer.bias is not None else None
+        h = F.linear(x, w_in, b_in)
+        
+        h = self.silu(h)
+        
+        w_out = self.out_layer.weight.float()
+        b_out = self.out_layer.bias.float() if self.out_layer.bias is not None else None
+        out = F.linear(h, w_out, b_out)
+        
+        return out.to(org_dtype)
 
     def forward(self, *args, **kwargs):
         if self.training and self.gradient_checkpointing:
