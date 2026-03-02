@@ -596,14 +596,21 @@ class Flux2(nn.Module):
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
 
     def forward(self, x: Tensor, x_ids: Tensor, timesteps: Tensor, ctx: Tensor, ctx_ids: Tensor, guidance: Tensor | None) -> Tensor:
+        # 1. NEW: Ensure inputs match the model's base weight dtype (bfloat16)
+        target_dtype = self.img_in.weight.dtype
+        x = x.to(target_dtype)
+        ctx = ctx.to(target_dtype)
+
         num_txt_tokens = ctx.shape[1]
 
-        timestep_emb = timestep_embedding(timesteps, 256).to(x.dtype)
+        # 2. UPDATED: Cast embeddings to target_dtype instead of x.dtype 
+        # (Because x.dtype might have originally been float32 before we casted it above)
+        timestep_emb = timestep_embedding(timesteps, 256).to(target_dtype)
         del timesteps
         vec = self.time_in(timestep_emb)
         
         if self.use_guidance_embed:
-            guidance_emb = timestep_embedding(guidance, 256).to(x.dtype)
+            guidance_emb = timestep_embedding(guidance, 256).to(target_dtype)
             vec = vec + self.guidance_in(guidance_emb)
             del guidance_emb
 
