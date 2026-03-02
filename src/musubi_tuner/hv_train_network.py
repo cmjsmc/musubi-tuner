@@ -340,18 +340,26 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
     return sigma
 
 
-def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, timesteps, device, dtype):
+def compute_loss_weighting_for_sd3(
+    weighting_scheme, 
+    noise_scheduler, 
+    timesteps, 
+    device, 
+    dtype
+):
     """Computes loss weighting scheme for SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
 
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
     """
-    if weighting_scheme not in ["sigma_sqrt", "cosmap", "structure_bell"]:
+    valid_schemes =["sigma_sqrt", "cosmap", "structure_bell", "staged_cosine"]
+    if weighting_scheme not in valid_schemes:
         return None
 
     # This retrieves the actual noise amount (0.0=Clean, 1.0=Noise)
-    sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype)
+    # Note: get_sigmas should be available in the scope calling this function
+    sigmas: torch.Tensor = get_sigmas(noise_scheduler, timesteps, device, n_dim=5, dtype=dtype) # type: ignore
 
     if weighting_scheme == "sigma_sqrt":
         weighting = (sigmas ** -2.0).float()
@@ -362,23 +370,28 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, noise_scheduler, times
 
     elif weighting_scheme == "structure_bell":
         # --- STRUCTURE FOCUS (Balanced Avg 1.0) ---
-        # Goal: Prioritize learning Composition (High/Mid Noise) over Fine Details (Clean).
-        #
-        # Mapping (based on sigmas):
-        # Sigma 0.0 (Clean Image) -> Weight 0.5 (Low priority)
-        # Sigma 0.5 (Mid Concepts) -> Weight 1.4 (Max priority)
-        # Sigma 1.0 (Pure Noise)  -> Weight 1.1 (High priority)
-        #
-        # Formula: y = -2.4x^2 + 3.0x + 0.5
-        # The integral is 1.2, so we scale by 0.8333 to keep the math neutral (Avg 1.0).
-
         t = sigmas
-
-        # 1. Calculate Raw Curve
         raw_weights = -2.4 * (t ** 2) + 3.0 * t + 0.5
-
-        # 2. Normalize to Avg 1.0
         weighting = raw_weights * 0.833333
+        
+    elif weighting_scheme == "staged_cosine":
+        # --- STAGED COSINE DECAY ---
+        # Goal: Keep High Noise strongly weighted (1.0), decay smoothly to mid concepts (0.5), 
+        # and aggressively decay for clean details (0.25).
+        t = sigmas
+        
+        # Base weight is 1.0 (for 0.7 <= t <= 1.0)
+        weighting = torch.ones_like(t)
+        
+        # 1. Mid phase: 0.4 <= t < 0.7
+        # Maps t=0.7 -> weight 1.0 | t=0.4 -> weight 0.5
+        val_mid = 0.75 + 0.25 * torch.cos(math.pi * (0.7 - t) / 0.3)
+        weighting = torch.where((t >= 0.4) & (t < 0.7), val_mid, weighting)
+        
+        # 2. Low phase: t < 0.4
+        # Maps t=0.4 -> weight 0.5 | t=0.0 -> weight 0.25
+        val_low = 0.375 + 0.125 * torch.cos(math.pi * (0.4 - t) / 0.4)
+        weighting = torch.where(t < 0.4, val_low, weighting)
 
     return weighting
 
@@ -2778,7 +2791,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--weighting_scheme",
         type=str,
         default="none",
-        choices=["logit_normal", "structure_bell", "mode", "cosmap", "sigma_sqrt", "none"],
+        choices=["logit_normal", "structure_bell", "staged_cosine", "mode", "cosmap", "sigma_sqrt", "none"],
         help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
     )
     parser.add_argument(
