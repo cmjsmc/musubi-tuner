@@ -2763,6 +2763,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
             "shift",
             "flux_shift",
             "flux2_shift",
+            "flux_smooth_tail",
             "qwen_shift",
             "logsnr",
             "qinglong_flux",
