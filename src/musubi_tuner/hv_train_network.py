@@ -846,7 +846,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "qinglong_flux"
             or args.timestep_sampling == "qinglong_qwen"
             or args.timestep_sampling == "flux2_shift"
-            or args.timestep_sampling == "flux_smooth_tail"  # <-- Added the new option here
+            or args.timestep_sampling == "flux_smooth_tail"  # <-- Added your new option
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -890,39 +890,31 @@ class NetworkTrainer:
                     logits_norm = logits_norm * args.sigmoid_scale
                     t = logits_norm.sigmoid()
                     t = (t * shift) / (1 + (shift - 1) * t)
-
-                # --- NEW IMPLEMENTATION HERE ---
+                    
+                # --- NEW IMPLEMENTATION ---
                 elif args.timestep_sampling == "flux_smooth_tail":
-                    # Custom piecewise CDF mapping exactly matches the desired density histogram 
+                    # Maps a standard uniform distribution exactly into your requested percentages.
+                    # This mathematical mapping guarantees the density shape stays perfectly flat 
+                    # across the intervals and strictly never goes down.
                     u = rand(batch_size, org_timesteps)
                     t = torch.zeros_like(u)
 
-                    # 1. [0.0 - 0.6] Flat, low density (10% of samples)
+                    # 1. 0 to 500: 0% of samples (implicit, as t maps start at 0.5)
+
+                    # 2. 500 to 700: 10% of samples (u between 0.00 and 0.10)
                     m1 = u < 0.10
                     if m1.any():
-                        t[m1] = u[m1] * 6.0  # linearly maps [0.0, 0.1] to [0.0, 0.6]
+                        t[m1] = 0.50 + (u[m1] / 0.10) * 0.20
 
-                    # 2. [0.6 - 0.7] Smooth up 600-650, sharp up to 700 (15% of samples)
-                    m2 = (u >= 0.10) & (u < 0.25)
+                    # 3. 700 to 800: 30% of samples (u between 0.10 and 0.40)
+                    m2 = (u >= 0.10) & (u < 0.40)
                     if m2.any():
-                        v2 = (u[m2] - 0.10) / 0.15
-                        # Quadratic easing: density increases heavily towards the upper bound (0.7)
-                        t[m2] = 0.60 + 0.10 * (1.0 - (1.0 - v2) ** 2)
+                        t[m2] = 0.70 + ((u[m2] - 0.10) / 0.30) * 0.10
 
-                    # 3. [0.7 - 0.85] Smooth up 700-800, sharp up to 850 (25% of samples)
-                    m3 = (u >= 0.25) & (u < 0.50)
+                    # 4. 800 to 1000: 60% of samples (u between 0.40 and 1.00)
+                    m3 = u >= 0.40
                     if m3.any():
-                        v3 = (u[m3] - 0.25) / 0.25
-                        # Same quadratic easing applied over a wider range
-                        t[m3] = 0.70 + 0.15 * (1.0 - (1.0 - v3) ** 2)
-
-                    # 4. [0.85 - 1.0] Highest density, peaking without sharp extreme slopes (50% of samples)
-                    m4 = u >= 0.50
-                    if m4.any():
-                        v4 = (u[m4] - 0.50) / 0.50
-                        # 1.7v - 0.7v^2 gently curves. It guarantees density is highest at 1.0 
-                        # but keeps the slope finite, preventing the 925-1000 extreme clustering.
-                        t[m4] = 0.85 + 0.15 * (1.7 * v4 - 0.7 * (v4 ** 2))
+                        t[m3] = 0.80 + ((u[m3] - 0.40) / 0.60) * 0.20
 
                 elif args.timestep_sampling == "logsnr":
                     logsnr = rand_logsnr(batch_size, args.logit_mean, args.logit_std, org_timesteps)
