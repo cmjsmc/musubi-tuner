@@ -216,18 +216,29 @@ class TimestepEmbedding(nn.Module):
             self.post_act = get_activation(post_act_fn)
 
     def forward(self, sample, condition=None):
-        if condition is not None:
-            sample = sample + self.cond_proj(condition)
-        sample = self.linear_1(sample)
+        org_dtype = sample.dtype
+        sample = sample.to(torch.float32)
 
-        if self.act is not None:
-            sample = self.act(sample)
+         if condition is not None:
+            condition = condition.to(torch.float32)
+            w_cond = self.cond_proj.weight.float()
+            sample = sample + F.linear(condition, w_cond, None)
 
-        sample = self.linear_2(sample)
-
-        if self.post_act is not None:
-            sample = self.post_act(sample)
-        return sample
+        w_lin1 = self.linear_1.weight.float()
+        b_lin1 = self.linear_1.bias.float() if self.linear_1.bias is not None else None
+        sample = F.linear(sample, w_lin1, b_lin1)
+ 
+         if self.act is not None:
+             sample = self.act(sample)
+ 
+        w_lin2 = self.linear_2.weight.float()
+        b_lin2 = self.linear_2.bias.float() if self.linear_2.bias is not None else None
+        sample = F.linear(sample, w_lin2, b_lin2)
+ 
+         if self.post_act is not None:
+             sample = self.post_act(sample)
+        
+        return sample.to(org_dtype)
 
 
 class Timesteps(nn.Module):
@@ -542,11 +553,18 @@ class AdaLayerNormContinuous(nn.Module):
             raise ValueError(f"unknown norm_type {norm_type}")
 
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
-        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
-        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
-        scale, shift = torch.chunk(emb, 2, dim=1)
+        org_dtype = x.dtype
+        cond_float = conditioning_embedding.to(torch.float32)
+        
+        w_lin = self.linear.weight.float()
+        b_lin = self.linear.bias.float() if self.linear.bias is not None else None
+        
+        emb = F.linear(self.silu(cond_float), w_lin, b_lin)
+         scale, shift = torch.chunk(emb, 2, dim=1)
+        
+        x = x.to(torch.float32)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
-        return x
+        return x.to(org_dtype)
 
 
 class GELU(nn.Module):
@@ -572,9 +590,15 @@ class GELU(nn.Module):
         return F.gelu(gate, approximate=self.approximate)
 
     def forward(self, hidden_states):
-        hidden_states = self.proj(hidden_states)
-        hidden_states = self.gelu(hidden_states)
-        return hidden_states
+        org_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        
+        w_proj = self.proj.weight.float()
+        b_proj = self.proj.bias.float() if self.proj.bias is not None else None
+        hidden_states = F.linear(hidden_states, w_proj, b_proj)
+        
+         hidden_states = self.gelu(hidden_states)
+        return hidden_states.to(org_dtype)
 
 
 class FeedForward(nn.Module):
@@ -624,9 +648,22 @@ class FeedForward(nn.Module):
             self.net.append(nn.Dropout(dropout))
 
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
-        return hidden_states
+        org_dtype = hidden_states.dtype
+        
+        # GELU and Dropout
+        hidden_states = self.net[0](hidden_states)
+        hidden_states = self.net[1](hidden_states)
+        
+        # Linear out
+        hidden_states = hidden_states.to(torch.float32)
+        w_out = self.net[2].weight.float()
+        b_out = self.net[2].bias.float() if self.net[2].bias is not None else None
+        hidden_states = F.linear(hidden_states, w_out, b_out)
+        
+        if len(self.net) > 3:
+            hidden_states = self.net[3](hidden_states)
+            
+        return hidden_states.to(org_dtype)
 
 
 # torch.inductor does not support code generation for complex
@@ -984,10 +1021,20 @@ class QwenImageTransformerBlock(nn.Module):
         timestep_zero_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
-        img_mod_params = self.img_mod(temb)  # [B, 6*dim]
-        if self.zero_cond_t:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
+        org_dtype = temb.dtype
+        temb_float = temb.to(torch.float32)
+        
+        w_img = self.img_mod[1].weight.float()
+        b_img = self.img_mod[1].bias.float() if self.img_mod[1].bias is not None else None
+        img_mod_params = F.linear(self.img_mod[0](temb_float), w_img, b_img).to(org_dtype)
+        
+         if self.zero_cond_t:
+             temb = torch.chunk(temb, 2, dim=0)[0]
+            temb_float = torch.chunk(temb_float, 2, dim=0)[0]
+            
+        w_txt = self.txt_mod[1].weight.float()
+        b_txt = self.txt_mod[1].bias.float() if self.txt_mod[1].bias is not None else None
+        txt_mod_params = F.linear(self.txt_mod[0](temb_float), w_txt, b_txt).to(org_dtype)
 
         # Split modulation parameters for norm1 and norm2
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
