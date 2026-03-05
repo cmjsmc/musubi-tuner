@@ -219,7 +219,7 @@ class TimestepEmbedding(nn.Module):
         org_dtype = sample.dtype
         sample = sample.to(torch.float32)
 
-         if condition is not None:
+        if condition is not None:
             condition = condition.to(torch.float32)
             w_cond = self.cond_proj.weight.float()
             sample = sample + F.linear(condition, w_cond, None)
@@ -228,15 +228,15 @@ class TimestepEmbedding(nn.Module):
         b_lin1 = self.linear_1.bias.float() if self.linear_1.bias is not None else None
         sample = F.linear(sample, w_lin1, b_lin1)
  
-         if self.act is not None:
-             sample = self.act(sample)
+        if self.act is not None:
+            sample = self.act(sample)
  
         w_lin2 = self.linear_2.weight.float()
         b_lin2 = self.linear_2.bias.float() if self.linear_2.bias is not None else None
         sample = F.linear(sample, w_lin2, b_lin2)
  
-         if self.post_act is not None:
-             sample = self.post_act(sample)
+        if self.post_act is not None:
+            sample = self.post_act(sample)
         
         return sample.to(org_dtype)
 
