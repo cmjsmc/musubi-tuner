@@ -560,7 +560,7 @@ class AdaLayerNormContinuous(nn.Module):
         b_lin = self.linear.bias.float() if self.linear.bias is not None else None
         
         emb = F.linear(self.silu(cond_float), w_lin, b_lin)
-         scale, shift = torch.chunk(emb, 2, dim=1)
+        scale, shift = torch.chunk(emb, 2, dim=1)
         
         x = x.to(torch.float32)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
@@ -597,7 +597,7 @@ class GELU(nn.Module):
         b_proj = self.proj.bias.float() if self.proj.bias is not None else None
         hidden_states = F.linear(hidden_states, w_proj, b_proj)
         
-         hidden_states = self.gelu(hidden_states)
+        hidden_states = self.gelu(hidden_states)
         return hidden_states.to(org_dtype)
 
 
@@ -1029,7 +1029,7 @@ class QwenImageTransformerBlock(nn.Module):
         img_mod_params = F.linear(self.img_mod[0](temb_float), w_img, b_img).to(org_dtype)
         
          if self.zero_cond_t:
-             temb = torch.chunk(temb, 2, dim=0)[0]
+            temb = torch.chunk(temb, 2, dim=0)[0]
             temb_float = torch.chunk(temb_float, 2, dim=0)[0]
             
         w_txt = self.txt_mod[1].weight.float()
