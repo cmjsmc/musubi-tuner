@@ -1028,7 +1028,7 @@ class QwenImageTransformerBlock(nn.Module):
         b_img = self.img_mod[1].bias.float() if self.img_mod[1].bias is not None else None
         img_mod_params = F.linear(self.img_mod[0](temb_float), w_img, b_img).to(org_dtype)
         
-         if self.zero_cond_t:
+        if self.zero_cond_t:
             temb = torch.chunk(temb, 2, dim=0)[0]
             temb_float = torch.chunk(temb_float, 2, dim=0)[0]
             
