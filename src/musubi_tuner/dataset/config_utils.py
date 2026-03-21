@@ -49,6 +49,7 @@ class ImageDatasetParams(BaseDatasetParams):
     image_jsonl_file: Optional[str] = None
     image_tar_file: Optional[str] = None
     control_directory: Optional[str] = None
+    control_tar_file: Optional[str] = None
     multiple_target: Optional[bool] = False
 
     # FramePack dependent parameters
@@ -67,6 +68,7 @@ class VideoDatasetParams(BaseDatasetParams):
     video_jsonl_file: Optional[str] = None
     video_tar_file: Optional[str] = None
     control_directory: Optional[str] = None
+    control_tar_file: Optional[str] = None
     target_frames: Sequence[int] = (1,)
     frame_extraction: Optional[str] = "head"
     frame_stride: Optional[int] = 1
@@ -127,6 +129,7 @@ class ConfigSanitizer:
         "image_tar_file": str,
         "cache_directory": str,
         "control_directory": str,
+        "control_tar_file": str,
         "multiple_target": bool,
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
@@ -140,6 +143,7 @@ class ConfigSanitizer:
         "video_jsonl_file": str,
         "video_tar_file": str,
         "control_directory": str,
+        "control_tar_file": str,
         "target_frames": [int],
         "frame_extraction": str,
         "frame_stride": int,
@@ -325,6 +329,7 @@ def generate_dataset_group_by_blueprint(
         image_directory: "{dataset.image_directory}"
         image_jsonl_file: "{dataset.image_jsonl_file}"
         control_directory: "{dataset.control_directory}"
+        control_tar_file: "{getattr(dataset, 'control_tar_file', None)}"
         multiple_target: {dataset.multiple_target}
         image_tar_file: "{getattr(dataset, 'image_tar_file', None)}"
         fp_latent_window_size: {dataset.fp_latent_window_size}
@@ -345,6 +350,7 @@ def generate_dataset_group_by_blueprint(
         video_jsonl_file: "{dataset.video_jsonl_file}"
         video_tar_file: "{getattr(dataset, 'video_tar_file', None)}"
         control_directory: "{dataset.control_directory}"
+        control_tar_file: "{getattr(dataset, 'control_tar_file', None)}"
         target_frames: {dataset.target_frames}
         frame_extraction: {dataset.frame_extraction}
         frame_stride: {dataset.frame_stride}
