@@ -1019,6 +1019,7 @@ class ImageDirectoryDatasource(ImageDatasource):
             image_directory: str,
             caption_extension: Optional[str] = None,
             control_directory: Optional[str] = None,
+            control_tar_file: Optional[str] = None,
             control_count_per_image: Optional[int] = None,
             multiple_target: bool = False,
     ):
@@ -1238,6 +1239,7 @@ class ImageTarDatasource(ImageDatasource):
             image_tar_file: str,
             caption_extension: Optional[str] = None,
             control_directory: Optional[str] = None,
+            control_tar_file: Optional[str] = None,
             control_count_per_image: Optional[int] = None,
             multiple_target: bool = False,
             dataset_passphrase: Optional[str] = None,
@@ -1294,7 +1296,81 @@ class ImageTarDatasource(ImageDatasource):
                 self.caption_members[img_member.name] = caption_map[img_basename]
 
         logger.info(f"found {len(self.image_members)} images in data source")
+        
+        self.control_directory = control_directory
+        self.control_tar_file = control_tar_file
+        self.control_count_per_image = control_count_per_image
         self.has_control = False
+        
+        if self.control_tar_file is not None:
+            self.has_control = True
+            self.control_tar_lock = threading.RLock()
+            logger.info(f"opening control tar data source: {self.control_tar_file}")
+
+            if self.control_tar_file.endswith(".gpg"):
+                if gnupg is None:
+                    raise ImportError("python-gnupg is not installed. Please install it to use encrypted datasets.")
+                if not dataset_passphrase:
+                    raise ValueError("Dataset is encrypted, but no passphrase was provided via --dataset_passphrase.")
+
+                gpg = gnupg.GPG()
+                with open(self.control_tar_file, "rb") as f:
+                    decrypted_data = gpg.decrypt_file(f, passphrase=dataset_passphrase)
+                    if not decrypted_data.ok:
+                        raise RuntimeError(f"Failed to decrypt file: {decrypted_data.status}")
+                    self.control_decrypted_stream = io.BytesIO(decrypted_data.data)
+                self.control_tar_obj = tarfile.open(fileobj=self.control_decrypted_stream, mode="r:gz")
+            else:
+                self.control_tar_obj = tarfile.open(self.control_tar_file, "r:gz")
+
+            self.control_members = {}
+            all_control_members = [m for m in self.control_tar_obj.getmembers() if m.isfile() and os.path.splitext(m.name)[1].lower() in IMAGE_EXTENSIONS]
+            all_control_members_set = set(all_control_members)
+
+            image_members_sorted = sorted(self.image_members, key=lambda m: len(os.path.basename(m.name)), reverse=True)
+
+            for img_member in image_members_sorted:
+                img_basename = os.path.basename(img_member.name)
+                img_basename_no_ext = os.path.splitext(img_basename)[0]
+
+                potential_ctrls = [
+                    m for m in all_control_members_set
+                    if os.path.basename(m.name).startswith(img_basename_no_ext + ".")
+                       or os.path.basename(m.name).startswith(img_basename_no_ext + "_")
+                ]
+
+                all_control_members_set.difference_update(potential_ctrls)
+
+                if potential_ctrls:
+                    def sort_key(m):
+                        basename_no_ext = os.path.splitext(os.path.basename(m.name))[0]
+                        if img_basename_no_ext == basename_no_ext:
+                            return 0
+                        digits_suffix = basename_no_ext.rsplit("_", 1)[-1]
+                        if not digits_suffix.isdigit():
+                            raise ValueError(f"Invalid digits suffix in {basename_no_ext}")
+                        return int(digits_suffix) + 1
+
+                    potential_ctrls.sort(key=sort_key)
+                    if self.control_count_per_image is not None and len(potential_ctrls) < self.control_count_per_image:
+                        logger.error(f"Not enough control images in tar for {img_member.name}")
+                        raise ValueError(f"Not enough control images in tar for {img_member.name}")
+
+                    self.control_members[img_member.name] = potential_ctrls[:self.control_count_per_image] if self.control_count_per_image is not None else potential_ctrls
+
+        elif self.control_directory is not None:
+            self.has_control = True
+            self.control_paths = {}
+            # Similar logic as ImageDirectoryDatasource for control paths if using image tar alongside control folder
+            all_control_image_paths = set(glob_images(self.control_directory))
+            image_members_sorted = sorted(self.image_members, key=lambda m: len(os.path.basename(m.name)), reverse=True)
+            for img_member in image_members_sorted:
+                img_basename = os.path.basename(img_member.name)
+                img_basename_no_ext = os.path.splitext(img_basename)[0]
+                potential_paths = [p for p in all_control_image_paths if os.path.basename(p).startswith(img_basename_no_ext + ".") or os.path.basename(p).startswith(img_basename_no_ext + "_")]
+                all_control_image_paths.difference_update(potential_paths)
+                if potential_paths:
+                    self.control_paths[img_member.name] = potential_paths[:self.control_count_per_image] if self.control_count_per_image is not None else potential_paths
 
     def is_indexable(self):
         return True
@@ -1342,8 +1418,42 @@ class ImageTarDatasource(ImageDatasource):
 
         _, caption = self.get_caption(idx)
         controls = None
+ 
+        if self.has_control:
+            controls = []
+            if getattr(self, "control_tar_file", None) is not None and image_key in self.control_members:
+                for ctrl_member in self.control_members[image_key]:
+                    ctrl_data = None
+                    try:
+                        with self.control_tar_lock:
+                            extracted_file = self.control_tar_obj.extractfile(ctrl_member)
+                            if extracted_file is not None:
+                                ctrl_data = extracted_file.read()
+                    except Exception as e:
+                        logger.error(f"Error reading tar control member {ctrl_member.name}: {e}")
+                        raise IOError(f"Could not read tar control member: {ctrl_member.name}") from e
 
-        return image_key, images, caption, controls
+                    if ctrl_data is not None:
+                        ctrl_bytes = io.BytesIO(ctrl_data)
+                        ctrl_bytes.seek(0)
+                        try:
+                            ctrl_img = Image.open(ctrl_bytes)
+                            if ctrl_img.mode != "RGB" and ctrl_img.mode != "RGBA":
+                                ctrl_img = ctrl_img.convert("RGB")
+                            ctrl_img.load()
+                            controls.append(ctrl_img)
+                        except Exception as e:
+                            logger.error(f"Failed to identify/load control image {ctrl_member.name}. Error: {e}")
+                            raise
+            elif getattr(self, "control_directory", None) is not None and getattr(self, "control_paths", None) and image_key in self.control_paths:
+                for ctrl_path in self.control_paths[image_key]:
+                    ctrl_img = Image.open(ctrl_path)
+                    if ctrl_img.mode != "RGB" and ctrl_img.mode != "RGBA":
+                        ctrl_img = ctrl_img.convert("RGB")
+                    ctrl_img.load()
+                    controls.append(ctrl_img)
+
+         return image_key, images, caption, controls
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_member = self.image_members[idx]
@@ -2117,6 +2227,7 @@ class ImageDataset(BaseDataset):
         image_jsonl_file: Optional[str] = None,
         image_tar_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        control_tar_file: Optional[str] = None,
         cache_directory: Optional[str] = None,
         dataset_passphrase: Optional[str] = None,
         multiple_target: bool = False,
@@ -2145,6 +2256,7 @@ class ImageDataset(BaseDataset):
         self.image_jsonl_file = image_jsonl_file
         self.image_tar_file = image_tar_file
         self.control_directory = control_directory
+        self.control_tar_file = control_tar_file
         self.multiple_target = multiple_target
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
@@ -2177,8 +2289,15 @@ class ImageDataset(BaseDataset):
         elif image_jsonl_file is not None:
             self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
         elif image_tar_file is not None:
-            self.datasource = ImageTarDatasource(image_tar_file, caption_extension, control_directory,
-                                                 control_count_per_image, multiple_target, dataset_passphrase)
+            self.datasource = ImageTarDatasource(
+                image_tar_file=image_tar_file, 
+                caption_extension=caption_extension, 
+                control_directory=control_directory,
+                control_tar_file=control_tar_file,
+                control_count_per_image=control_count_per_image, 
+                multiple_target=multiple_target, 
+                dataset_passphrase=dataset_passphrase
+            )
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
@@ -2202,6 +2321,8 @@ class ImageDataset(BaseDataset):
             metadata["image_tar_file"] = os.path.basename(self.image_tar_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
+        if getattr(self, "control_tar_file", None) is not None:
+            metadata["control_tar_file"] = os.path.basename(self.control_tar_file)
         metadata["has_control"] = self.has_control
         return metadata
 
