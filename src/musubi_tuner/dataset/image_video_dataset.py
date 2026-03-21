@@ -1453,7 +1453,7 @@ class ImageTarDatasource(ImageDatasource):
                     ctrl_img.load()
                     controls.append(ctrl_img)
 
-         return image_key, images, caption, controls
+        return image_key, images, caption, controls
 
     def get_caption(self, idx: int) -> tuple[str, str]:
         image_member = self.image_members[idx]
