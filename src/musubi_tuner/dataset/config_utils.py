@@ -433,6 +433,24 @@ def load_user_config(file: str) -> dict:
     return config
 
 
+def _mask_sensitive_data(config: dict) -> dict:
+    import copy
+    masked_config = copy.deepcopy(config)
+
+    def recursive_mask(d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                recursive_mask(v)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        recursive_mask(item)
+            elif k in ["dataset_passphrase", "wandb_api_key", "huggingface_token"]:
+                d[k] = "********" # Mask out sensitive strings
+
+    recursive_mask(masked_config)
+    return masked_config
+
 # for config test
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -450,14 +468,14 @@ if __name__ == "__main__":
 
     logger.info("")
     logger.info("[user_config]")
-    logger.info(f"{user_config}")
+    logger.info(f"{_mask_sensitive_data(user_config)}")
 
     sanitizer = ConfigSanitizer()
     sanitized_user_config = sanitizer.sanitize_user_config(user_config)
 
     logger.info("")
     logger.info("[sanitized_user_config]")
-    logger.info(f"{sanitized_user_config}")
+    logger.info(f"{_mask_sensitive_data(sanitized_user_config)}")
 
     blueprint = BlueprintGenerator(sanitizer).generate(user_config, argparse_namespace)
 
