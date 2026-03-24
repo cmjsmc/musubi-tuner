@@ -1251,7 +1251,7 @@ class ImageTarDatasource(ImageDatasource):
         self.current_idx = 0
         self.tar_lock = threading.RLock()  # CRITICAL: Lock for thread safety
 
-        logger.info(f"opening data source: {self.image_tar_file}")
+        logger.info(f"opening data source: {os.path.basename(self.image_tar_file)}")
 
         if self.image_tar_file.endswith(".gpg"):
             if gnupg is None:
@@ -1301,11 +1301,11 @@ class ImageTarDatasource(ImageDatasource):
         self.control_tar_file = control_tar_file
         self.control_count_per_image = control_count_per_image
         self.has_control = False
-        
+
         if self.control_tar_file is not None:
             self.has_control = True
             self.control_tar_lock = threading.RLock()
-            logger.info(f"opening control tar data source: {self.control_tar_file}")
+            logger.info(f"opening control tar data source: {os.path.basename(self.control_tar_file)}")
 
             if self.control_tar_file.endswith(".gpg"):
                 if gnupg is None:
@@ -1824,7 +1824,7 @@ class VideoTarDatasource(VideoDatasource):
         self.caption_extension = caption_extension
         self.current_idx = 0
 
-        logger.info(f"opening data source: {self.video_tar_file}")
+        logger.info(f"opening data source: {os.path.basename(self.video_tar_file)}")
         if self.video_tar_file.endswith(".gpg"):
             if gnupg is None:
                 raise ImportError("python-gnupg is not installed. Please install it to use encrypted datasets.")
