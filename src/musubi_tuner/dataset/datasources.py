@@ -74,7 +74,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         self.current_idx = 0
 
         # glob images
-        logger.info(f"glob images in {self.image_directory}")
+        # logger.info(f"glob images in {self.image_directory}")
         self.image_paths = glob_images(self.image_directory, caption_extension=self.caption_extension)
         logger.info(f"found {len(self.image_paths)} images")
 
@@ -135,7 +135,7 @@ class ImageDirectoryDatasource(ImageDatasource):
 
         # glob control images if specified
         if self.control_directory is not None:
-            logger.info(f"glob control images in {self.control_directory}")
+            # logger.info(f"glob control images in {self.control_directory}")
             self.has_control = True
             self.control_paths = {}
 
@@ -185,9 +185,9 @@ class ImageDirectoryDatasource(ImageDatasource):
                     self.control_paths[image_path] = (
                         potential_paths[:control_count_per_image] if control_count_per_image is not None else potential_paths
                     )
-            logger.info(
-                f"found {len(self.control_paths)} matching control images for {'arbitrary' if control_count_per_image is None else control_count_per_image} images"
-            )
+            # logger.info(
+            #     f"found {len(self.control_paths)} matching control images for {'arbitrary' if control_count_per_image is None else control_count_per_image} images"
+            # )
 
             # log the distribution of number of control images
             count_of_num_control_images = {}
