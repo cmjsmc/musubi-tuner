@@ -437,26 +437,26 @@ if __name__ == "__main__":
     parser.add_argument("--debug_dataset", action="store_true")
     argparse_namespace = parser.parse_args(remain)
 
-    logger.info("[argparse_namespace]")
-    logger.info(f"{vars(argparse_namespace)}")
+    # logger.info("[argparse_namespace]")
+    # logger.info(f"{vars(argparse_namespace)}")
 
     user_config = load_user_config(config_args.dataset_config)
 
-    logger.info("")
-    logger.info("[user_config]")
-    logger.info(f"{user_config}")
+    # logger.info("")
+    # logger.info("[user_config]")
+    # logger.info(f"{user_config}")
 
     sanitizer = ConfigSanitizer()
     sanitized_user_config = sanitizer.sanitize_user_config(user_config)
 
-    logger.info("")
-    logger.info("[sanitized_user_config]")
-    logger.info(f"{sanitized_user_config}")
+    # logger.info("")
+    # logger.info("[sanitized_user_config]")
+    # logger.info(f"{sanitized_user_config}")
 
     blueprint = BlueprintGenerator(sanitizer).generate(user_config, argparse_namespace)
 
-    logger.info("")
-    logger.info("[blueprint]")
-    logger.info(f"{blueprint}")
+    # logger.info("")
+    # logger.info("[blueprint]")
+    # logger.info(f"{blueprint}")
 
     dataset_group = generate_dataset_group_by_blueprint(blueprint.dataset_group)
