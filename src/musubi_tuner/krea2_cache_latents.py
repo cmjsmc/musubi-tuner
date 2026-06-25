@@ -19,7 +19,7 @@ from musubi_tuner.qwen_image import qwen_image_autoencoder_kl
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def encode_and_save_batch(vae: qwen_image_autoencoder_kl.AutoencoderKLQwenImage, batch: List[ItemInfo]):
