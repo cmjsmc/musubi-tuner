@@ -661,3 +661,234 @@ class VideoJsonlDatasource(VideoDatasource):
 
         self.current_idx += 1
         return fetcher
+
+
+# --- ADDED TO THE BOTTOM OF THE FILE ---
+import io
+import tarfile
+import threading
+import numpy as np
+from typing import Any
+from musubi_tuner.dataset.media_utils import IMAGE_EXTENSIONS
+
+try:
+    import gnupg
+except ImportError:
+    gnupg = None
+
+
+class ImageTarDatasource(ImageDatasource):
+    def __init__(
+            self,
+            image_tar_file: str,
+            caption_extension: Optional[str] = None,
+            control_directory: Optional[str] = None,
+            control_count_per_image: Optional[int] = None,
+            multiple_target: bool = False,
+            dataset_passphrase: Optional[str] = None,
+    ):
+        super().__init__()
+        self.image_tar_file = image_tar_file
+        self.caption_extension = caption_extension
+        self.multiple_target = multiple_target
+        self.current_idx = 0
+        self.tar_lock = threading.RLock()
+
+        logger.info(f"opening data source: {self.image_tar_file}")
+
+        if self.image_tar_file.endswith(".gpg"):
+            if gnupg is None:
+                raise ImportError("python-gnupg is not installed. Please install it to use encrypted datasets.")
+            if not dataset_passphrase:
+                raise ValueError("Dataset is encrypted, but no passphrase was provided via --dataset_passphrase.")
+
+            gpg = gnupg.GPG()
+            with open(self.image_tar_file, "rb") as f:
+                decrypted_data = gpg.decrypt_file(f, passphrase=dataset_passphrase)
+                if not decrypted_data.ok:
+                    raise RuntimeError(f"Failed to decrypt file: {decrypted_data.status}")
+                decrypted_stream = io.BytesIO(decrypted_data.data)
+            self.tar_file = tarfile.open(fileobj=decrypted_stream, mode="r:gz")
+        else:
+            self.tar_file = tarfile.open(self.image_tar_file, "r:gz")
+
+        self.image_members = []
+        caption_map = {}
+        for member in self.tar_file.getmembers():
+            if not member.isfile():
+                continue
+            file_path = member.name
+            _, extension = os.path.splitext(file_path)
+            if extension.lower() in IMAGE_EXTENSIONS:
+                self.image_members.append(member)
+            elif self.caption_extension and extension == self.caption_extension:
+                caption_basename = os.path.basename(os.path.splitext(file_path)[0])
+                caption_map[caption_basename] = member
+
+        self.image_members.sort(key=lambda m: m.name)
+
+        self.caption_members = {}
+        for img_member in self.image_members:
+            img_basename = os.path.basename(os.path.splitext(img_member.name)[0])
+            if img_basename in caption_map:
+                self.caption_members[img_member.name] = caption_map[img_basename]
+
+        logger.info(f"found {len(self.image_members)} images in data source")
+        self.has_control = False
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.image_members)
+
+    def get_image_data(self, idx: int) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+        image_member = self.image_members[idx]
+        image_key = image_member.name
+        initial_data = None
+        try:
+            with self.tar_lock:
+                extracted_file = self.tar_file.extractfile(image_member)
+                if extracted_file is not None:
+                    initial_data = extracted_file.read()
+        except Exception as e:
+            logger.error(f"Error reading tar member {image_key}: {e}")
+            raise IOError(f"Could not read tar member: {image_key}") from e
+
+        if initial_data is None:
+            raise IOError(f"Could not extract file from tar: {image_key}")
+
+        image_bytes = io.BytesIO(initial_data)
+        image_bytes.seek(0)
+        image_paths = [image_bytes]
+        images = []
+        for p in image_paths:
+            img = Image.open(p)
+            if img.mode != "RGB" and img.mode != "RGBA":
+                img = img.convert("RGB")
+            img.load()
+            images.append(img)
+
+        _, caption = self.get_caption(idx)
+        return image_key, images, caption, None
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        image_member = self.image_members[idx]
+        image_key = image_member.name
+        caption = ""
+        if image_key in self.caption_members:
+            caption_member = self.caption_members[image_key]
+            content = None
+            with self.tar_lock:
+                extracted_file = self.tar_file.extractfile(caption_member)
+                if extracted_file is not None:
+                    content = extracted_file.read()
+            if content is not None:
+                caption = content.decode("utf-8").strip()
+        return image_key, caption
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self) -> callable:
+        if self.current_idx >= len(self.image_members):
+            raise StopIteration
+        fetcher = (lambda: self.get_caption(self.current_idx)) if self.caption_only else (lambda: self.get_image_data(self.current_idx))
+        self.current_idx += 1
+        return fetcher
+
+
+class VideoTarDatasource(VideoDatasource):
+    def __init__(self, video_tar_file: str, caption_extension: Optional[str] = None,
+                 control_directory: Optional[str] = None, dataset_passphrase: Optional[str] = None):
+        super().__init__()
+        self.video_tar_file = video_tar_file
+        self.caption_extension = caption_extension
+        self.current_idx = 0
+
+        logger.info(f"opening data source: {self.video_tar_file}")
+        if self.video_tar_file.endswith(".gpg"):
+            if gnupg is None:
+                raise ImportError("python-gnupg is not installed. Please install it to use encrypted datasets.")
+            if not dataset_passphrase:
+                raise ValueError("Dataset is encrypted, but no passphrase was provided via --dataset_passphrase.")
+
+            gpg = gnupg.GPG()
+            with open(self.video_tar_file, "rb") as f:
+                decrypted_data = gpg.decrypt_file(f, passphrase=dataset_passphrase)
+                if not decrypted_data.ok:
+                    raise RuntimeError(f"Failed to decrypt file: {decrypted_data.status}")
+                decrypted_stream = io.BytesIO(decrypted_data.data)
+            self.tar_file = tarfile.open(fileobj=decrypted_stream, mode="r:gz")
+        else:
+            self.tar_file = tarfile.open(self.video_tar_file, "r:gz")
+
+        self.video_members = []
+        caption_map = {}
+        for member in self.tar_file.getmembers():
+            if not member.isfile():
+                continue
+            file_path = member.name
+            _, extension = os.path.splitext(file_path)
+            if extension.lower() in VIDEO_EXTENSIONS:
+                self.video_members.append(member)
+            elif self.caption_extension and extension == self.caption_extension:
+                caption_basename = os.path.basename(os.path.splitext(file_path)[0])
+                caption_map[caption_basename] = member
+
+        self.video_members.sort(key=lambda m: m.name)
+
+        self.caption_members = {}
+        for vid_member in self.video_members:
+            vid_basename = os.path.basename(os.path.splitext(vid_member.name)[0])
+            if vid_basename in caption_map:
+                self.caption_members[vid_member.name] = caption_map[vid_basename]
+
+        logger.info(f"found {len(self.video_members)} videos in data source")
+        self.has_control = False
+
+    def is_indexable(self):
+        return True
+
+    def __len__(self):
+        return len(self.video_members)
+
+    def get_video_data_from_path(self, video_member: tarfile.TarInfo, start_frame: Optional[int] = None,
+                                 end_frame: Optional[int] = None, bucket_selector: Optional["BucketSelector"] = None) -> list[np.ndarray]:
+        extracted_file = self.tar_file.extractfile(video_member)
+        if extracted_file is None:
+            raise IOError(f"Could not extract file from tar: {video_member.name}")
+        with extracted_file as f:
+            return load_video(f, start_frame=start_frame, end_frame=end_frame, bucket_selector=bucket_selector,
+                              source_fps=self.source_fps, target_fps=self.target_fps)
+
+    def get_caption(self, idx: int) -> tuple[str, str]:
+        video_member = self.video_members[idx]
+        video_key = video_member.name
+        caption = ""
+        if video_key in self.caption_members:
+            caption_member = self.caption_members[video_key]
+            extracted_file = self.tar_file.extractfile(caption_member)
+            if extracted_file is not None:
+                with extracted_file as f:
+                    caption = f.read().decode("utf-8").strip()
+        return video_key, caption
+
+    def get_video_data(self, idx: int, start_frame: Optional[int] = None, end_frame: Optional[int] = None,
+                       bucket_selector: Optional["BucketSelector"] = None) -> tuple[str, list[Image.Image], str, Optional[list[Image.Image]]]:
+        video_member = self.video_members[idx]
+        video = self.get_video_data_from_path(video_member, start_frame, end_frame, bucket_selector)
+        _, caption = self.get_caption(idx)
+        return video_member.name, video, caption, None
+
+    def __iter__(self):
+        self.current_idx = 0
+        return self
+
+    def __next__(self):
+        if self.current_idx >= len(self.video_members):
+            raise StopIteration
+        fetcher = (lambda: self.get_caption(self.current_idx)) if self.caption_only else (lambda: self.get_video_data(self.current_idx))
+        self.current_idx += 1
+        return fetcher
