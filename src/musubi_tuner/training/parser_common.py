@@ -45,6 +45,14 @@ def _add_general_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="config file for dataset / データセットの設定ファイル",
     )
+    # >>> NEWLY ADDED >>>
+    parser.add_argument(
+        "--dataset_passphrase",
+        type=str,
+        default=None,
+        help="passphrase for encrypted dataset archives (.tar.gz.gpg) / 暗号化されたデータセットアーカイブのパスフレーズ",
+    )
+    # <<< END ADDED <<<
 
 
 def _add_attention_args(parser: argparse.ArgumentParser) -> None:
