@@ -1,19 +1,29 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
+from importlib.util import find_spec
+import io
+import json
+import math
 import os
 import random
+import tarfile
 import time
 from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+import threading
 
 if TYPE_CHECKING:
     from multiprocessing.sharedctypes import Synchronized
 
 SharedEpoch = Optional["Synchronized[int]"]
 
-
 import numpy as np
 import torch
 from PIL import Image
+
+try:
+    import gnupg
+except ImportError:
+    gnupg = None
 
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import remove_dtype_suffix
@@ -43,14 +53,14 @@ from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit 
 
 class ItemInfo:
     def __init__(
-        self,
-        item_key: str,
-        caption: str,
-        original_size: tuple[int, int],
-        bucket_size: Optional[tuple[Any]] = None,
-        frame_count: Optional[int] = None,
-        content: Optional[Union[np.ndarray, list[np.ndarray]]] = None,
-        latent_cache_path: Optional[str] = None,
+            self,
+            item_key: str,
+            caption: str,
+            original_size: tuple[int, int],
+            bucket_size: Optional[tuple[Any]] = None,
+            frame_count: Optional[int] = None,
+            content: Optional[Union[np.ndarray, list[np.ndarray]]] = None,
+            latent_cache_path: Optional[str] = None,
     ) -> None:
         self.item_key = item_key
         self.caption = caption
@@ -72,8 +82,8 @@ class ItemInfo:
 
     def __str__(self) -> str:
         return (
-            f"ItemInfo(item_key={self.item_key}, caption={self.caption}, "
-            + f"original_size={self.original_size}, bucket_size={self.bucket_size}, "
+                f"ItemInfo(item_key={self.item_key}, caption={self.caption}, "
+                + f"original_size={self.original_size}, bucket_size={self.bucket_size}, "
             + f"frame_count={self.frame_count}, latent_cache_path={self.latent_cache_path}, "
             + f"content={[c.shape for c in self.content] if isinstance(self.content, list) else (self.content.shape if self.content is not None else None)}), "
             + f"control_content={[cc.shape for cc in self.control_content] if isinstance(self.control_content, list) else (self.control_content.shape if self.control_content is not None else None)})"
@@ -91,9 +101,11 @@ from musubi_tuner.dataset.datasources import (  # noqa: F401
     ImageDatasource,
     ImageDirectoryDatasource,
     ImageJsonlDatasource,
+    ImageTarDatasource,
     VideoDatasource,
     VideoDirectoryDatasource,
     VideoJsonlDatasource,
+    VideoTarDatasource,
 )
 
 
@@ -105,16 +117,17 @@ from musubi_tuner.dataset.datasources import (  # noqa: F401
 
 class BaseDataset(torch.utils.data.Dataset):
     def __init__(
-        self,
-        resolution: Tuple[int, int] = (960, 544),
-        caption_extension: Optional[str] = None,
-        batch_size: int = 1,
-        num_repeats: int = 1,
-        enable_bucket: bool = False,
-        bucket_no_upscale: bool = False,
-        cache_directory: Optional[str] = None,
-        debug_dataset: bool = False,
-        architecture: str = "no_default",
+            self,
+            resolution: Tuple[int, int] = (960, 544),
+            caption_extension: Optional[str] = None,
+            batch_size: int = 1,
+            num_repeats: int = 1,
+            enable_bucket: bool = False,
+            bucket_no_upscale: bool = False,
+            cache_directory: Optional[str] = None,
+            dataset_passphrase: Optional[str] = None,
+            debug_dataset: bool = False,
+            architecture: str = "no_default",
     ):
         self.resolution = resolution
         self.caption_extension = caption_extension
@@ -123,6 +136,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.enable_bucket = enable_bucket
         self.bucket_no_upscale = bucket_no_upscale
         self.cache_directory = cache_directory
+        self.dataset_passphrase = dataset_passphrase
         self.debug_dataset = debug_dataset
         self.architecture = architecture
         self.seed = None
@@ -209,7 +223,8 @@ class BaseDataset(torch.utils.data.Dataset):
             logger.warning(f"epoch is not incremented. current_epoch: {self.current_epoch}, epoch: {epoch}")
             self.current_epoch = epoch
 
-    def _default_retrieve_text_encoder_output_cache_batches(self, datasource: ContentDatasource, batch_size: int, num_workers: int):
+    def _default_retrieve_text_encoder_output_cache_batches(self, datasource: ContentDatasource, batch_size: int,
+                                                            num_workers: int):
         datasource.set_caption_only(True)
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
@@ -276,8 +291,10 @@ class ImageDataset(BaseDataset):
         bucket_no_upscale: bool,
         image_directory: Optional[str] = None,
         image_jsonl_file: Optional[str] = None,
+        image_tar_file: Optional[str] = None,
         control_directory: Optional[str] = None,
         cache_directory: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
         multiple_target: bool = False,
         fp_latent_window_size: Optional[int] = 9,
         fp_1f_clean_indices: Optional[list[int]] = None,
@@ -296,11 +313,13 @@ class ImageDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            dataset_passphrase,
             debug_dataset,
             architecture,
         )
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
+        self.image_tar_file = image_tar_file
         self.control_directory = control_directory
         self.multiple_target = multiple_target
         self.fp_latent_window_size = fp_latent_window_size
@@ -335,11 +354,17 @@ class ImageDataset(BaseDataset):
             )
         elif image_jsonl_file is not None:
             self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
+        elif image_tar_file is not None:
+            self.datasource = ImageTarDatasource(image_tar_file, caption_extension, control_directory,
+                                                 control_count_per_image, multiple_target, dataset_passphrase)
         else:
             raise ValueError("image_directory or image_jsonl_file must be specified")
 
         if self.cache_directory is None:
-            self.cache_directory = self.image_directory
+            if self.image_directory is not None:
+                self.cache_directory = self.image_directory
+            elif self.image_tar_file is not None:
+                raise ValueError("cache_directory must be specified when using a tar file.")
 
         self.batch_manager = None
         self.num_train_items = 0
@@ -351,6 +376,8 @@ class ImageDataset(BaseDataset):
             metadata["image_directory"] = os.path.basename(self.image_directory)
         if self.image_jsonl_file is not None:
             metadata["image_jsonl_file"] = os.path.basename(self.image_jsonl_file)
+        if self.image_tar_file is not None:
+            metadata["image_tar_file"] = os.path.basename(self.image_tar_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["has_control"] = self.has_control
@@ -426,9 +453,9 @@ class ImageDataset(BaseDataset):
         def submit_batch(flush: bool = False):
             for key in batches:
                 if len(batches[key]) >= self.batch_size or flush:
-                    batch = batches[key][0 : self.batch_size]
+                    batch = batches[key][0: self.batch_size]
                     if len(batches[key]) > self.batch_size:
-                        batches[key] = batches[key][self.batch_size :]
+                        batches[key] = batches[key][self.batch_size:]
                     else:
                         del batches[key]
                     return key, batch
@@ -518,7 +545,8 @@ class ImageDataset(BaseDataset):
             image_size = (image_width, image_height)
 
             item_key = "_".join(tokens[:-2])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            text_encoder_output_cache_file = os.path.join(self.cache_directory,
+                                                          f"{item_key}_{self.architecture}_te.safetensors")
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
@@ -555,7 +583,8 @@ class ImageDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size,
+                                                num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
@@ -583,26 +612,28 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
 
     def __init__(
-        self,
-        resolution: Tuple[int, int],
-        caption_extension: Optional[str],
-        batch_size: int,
-        num_repeats: int,
-        enable_bucket: bool,
-        bucket_no_upscale: bool,
-        frame_extraction: Optional[str] = "head",
-        frame_stride: Optional[int] = 1,
-        frame_sample: Optional[int] = 1,
-        target_frames: Optional[list[int]] = None,
-        max_frames: Optional[int] = None,
-        source_fps: Optional[float] = None,
-        video_directory: Optional[str] = None,
-        video_jsonl_file: Optional[str] = None,
-        control_directory: Optional[str] = None,
-        cache_directory: Optional[str] = None,
-        fp_latent_window_size: Optional[int] = 9,
-        debug_dataset: bool = False,
-        architecture: str = "no_default",
+            self,
+            resolution: Tuple[int, int],
+            caption_extension: Optional[str],
+            batch_size: int,
+            num_repeats: int,
+            enable_bucket: bool,
+            bucket_no_upscale: bool,
+            frame_extraction: Optional[str] = "head",
+            frame_stride: Optional[int] = 1,
+            frame_sample: Optional[int] = 1,
+            target_frames: Optional[list[int]] = None,
+            max_frames: Optional[int] = None,
+            source_fps: Optional[float] = None,
+            video_directory: Optional[str] = None,
+            video_jsonl_file: Optional[str] = None,
+            video_tar_file: Optional[str] = None,
+            control_directory: Optional[str] = None,
+            cache_directory: Optional[str] = None,
+            dataset_passphrase: Optional[str] = None,
+            fp_latent_window_size: Optional[int] = 9,
+            debug_dataset: bool = False,
+            architecture: str = "no_default",
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -612,11 +643,13 @@ class VideoDataset(BaseDataset):
             enable_bucket,
             bucket_no_upscale,
             cache_directory,
+            dataset_passphrase,
             debug_dataset,
             architecture,
         )
         self.video_directory = video_directory
         self.video_jsonl_file = video_jsonl_file
+        self.video_tar_file = video_tar_file
         self.control_directory = control_directory
         self.frame_extraction = frame_extraction
         self.frame_stride = frame_stride
@@ -662,16 +695,25 @@ class VideoDataset(BaseDataset):
             self.datasource = VideoDirectoryDatasource(video_directory, caption_extension, control_directory)
         elif video_jsonl_file is not None:
             self.datasource = VideoJsonlDatasource(video_jsonl_file)
+        elif video_tar_file is not None:
+            self.datasource = VideoTarDatasource(video_tar_file, caption_extension, control_directory,
+                                                 dataset_passphrase)
+        else:
+            raise ValueError("video_directory, video_jsonl_file, or video_tar_file must be specified")
 
         if self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
-            logger.warning("frame_sample is set to 1 for frame_extraction=uniform. frame_extraction is changed to head.")
+            logger.warning(
+                "frame_sample is set to 1 for frame_extraction=uniform. frame_extraction is changed to head.")
         if self.frame_extraction == "head":
             # head extraction. we can limit the number of frames to be extracted
             self.datasource.set_start_and_end_frame(0, max(self.target_frames))
 
         if self.cache_directory is None:
-            self.cache_directory = self.video_directory
+            if self.video_directory is not None:
+                self.cache_directory = self.video_directory
+            elif self.video_tar_file is not None:
+                raise ValueError("cache_directory must be specified when using a tar file.")
 
         self.batch_manager = None
         self.num_train_items = 0
@@ -683,6 +725,8 @@ class VideoDataset(BaseDataset):
             metadata["video_directory"] = os.path.basename(self.video_directory)
         if self.video_jsonl_file is not None:
             metadata["video_jsonl_file"] = os.path.basename(self.video_jsonl_file)
+        if self.video_tar_file is not None:
+            metadata["video_tar_file"] = os.path.basename(self.video_tar_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
         metadata["frame_extraction"] = self.frame_extraction
@@ -771,7 +815,7 @@ class VideoDataset(BaseDataset):
                         raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
 
                     for crop_pos, target_frame in crop_pos_and_frames:
-                        cropped_video = video[crop_pos : crop_pos + target_frame]
+                        cropped_video = video[crop_pos: crop_pos + target_frame]
                         body, ext = os.path.splitext(video_key)
                         item_key = f"{body}_{crop_pos:05d}-{target_frame:03d}{ext}"
                         batch_key = (*bucket_reso, target_frame)  # bucket_reso with frame_count
@@ -783,10 +827,11 @@ class VideoDataset(BaseDataset):
                         # crop control video if available
                         cropped_control = None
                         if control_video is not None:
-                            cropped_control = control_video[crop_pos : crop_pos + target_frame]
+                            cropped_control = control_video[crop_pos: crop_pos + target_frame]
 
                         item_info = ItemInfo(
-                            item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
+                            item_key, caption, original_frame_size, batch_key, frame_count=target_frame,
+                            content=cropped_video
                         )
                         item_info.latent_cache_path = self.get_latent_cache_path(item_info)
                         item_info.control_content = cropped_control  # None is allowed
@@ -801,9 +846,9 @@ class VideoDataset(BaseDataset):
         def submit_batch(flush: bool = False):
             for key in batches:
                 if len(batches[key]) >= self.batch_size or flush:
-                    batch = batches[key][0 : self.batch_size]
+                    batch = batches[key][0: self.batch_size]
                     if len(batches[key]) > self.batch_size:
-                        batches[key] = batches[key][self.batch_size :]
+                        batches[key] = batches[key][self.batch_size:]
                     else:
                         del batches[key]
                     return key, batch
@@ -811,7 +856,8 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(op: callable) -> tuple[
+                tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
                 result = op()
 
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
@@ -861,7 +907,8 @@ class VideoDataset(BaseDataset):
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
 
         # assign cache files to item info
-        bucketed_item_info: dict[tuple[int, int, int], list[ItemInfo]] = {}  # (width, height, frame_count) -> [ItemInfo]
+        bucketed_item_info: dict[
+            tuple[int, int, int], list[ItemInfo]] = {}  # (width, height, frame_count) -> [ItemInfo]
         for cache_file in latent_cache_files:
             tokens = os.path.basename(cache_file).split("_")
 
@@ -873,14 +920,16 @@ class VideoDataset(BaseDataset):
             frame_pos, frame_count = int(frame_pos), int(frame_count)
 
             item_key = "_".join(tokens[:-3])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
+            text_encoder_output_cache_file = os.path.join(self.cache_directory,
+                                                          f"{item_key}_{self.architecture}_te.safetensors")
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
             bucket_reso = (*bucket_reso, frame_count)
-            item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count, latent_cache_path=cache_file)
+            item_info = ItemInfo(item_key, "", image_size, bucket_reso, frame_count=frame_count,
+                                 latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
 
             bucket = bucketed_item_info.get(bucket_reso, [])
@@ -889,7 +938,8 @@ class VideoDataset(BaseDataset):
             bucketed_item_info[bucket_reso] = bucket
 
         # prepare batch manager
-        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size, num_timestep_buckets=num_timestep_buckets)
+        self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size,
+                                                num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()
 
         self.num_train_items = sum([len(bucket) for bucket in bucketed_item_info.values()])
