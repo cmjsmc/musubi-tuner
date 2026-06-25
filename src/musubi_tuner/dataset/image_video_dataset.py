@@ -25,6 +25,11 @@ try:
 except ImportError:
     gnupg = None
 
+try:
+    import gnupg
+except ImportError:
+    gnupg = None
+
 from musubi_tuner.utils import safetensors_utils
 from musubi_tuner.utils.model_utils import remove_dtype_suffix
 

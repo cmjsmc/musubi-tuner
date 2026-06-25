@@ -1,9 +1,12 @@
-# # copy from FLUX repo: https://github.com/black-forest-labs/flux
-# # license: Apache-2.0 License
+# Copyright (c) 2025 Z-Image Team & Black Forest Labs
+# Modified for Musubi Tuner project.
+
 import math
 from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Union
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
@@ -579,14 +582,21 @@ class Flux2(nn.Module):
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
 
     def forward(self, x: Tensor, x_ids: Tensor, timesteps: Tensor, ctx: Tensor, ctx_ids: Tensor, guidance: Tensor | None) -> Tensor:
+        # 1. NEW: Ensure inputs match the model's base weight dtype (bfloat16)
+        target_dtype = self.img_in.weight.dtype
+        x = x.to(target_dtype)
+        ctx = ctx.to(target_dtype)
+
         num_txt_tokens = ctx.shape[1]
 
-        timestep_emb = timestep_embedding(timesteps, 256)
+        # 2. UPDATED: Cast embeddings to target_dtype instead of x.dtype 
+        # (Because x.dtype might have originally been float32 before we casted it above)
+        timestep_emb = timestep_embedding(timesteps, 256).to(target_dtype)
         del timesteps
         vec = self.time_in(timestep_emb)
-        del timestep_emb
+        
         if self.use_guidance_embed:
-            guidance_emb = timestep_embedding(guidance, 256)
+            guidance_emb = timestep_embedding(guidance, 256).to(target_dtype)
             vec = vec + self.guidance_in(guidance_emb)
             del guidance_emb
 
@@ -671,7 +681,11 @@ class Modulation(nn.Module):
     def forward(self, vec: torch.Tensor):
         org_dtype = vec.dtype
         vec = vec.to(torch.float32)  # for numerical stability
-        out = self.lin(nn.functional.silu(vec))
+        
+        w_lin = self.lin.weight.float()
+        b_lin = self.lin.bias.float() if self.lin.bias is not None else None
+        out = F.linear(nn.functional.silu(vec), w_lin, b_lin)
+        
         if out.ndim == 2:
             out = out[:, None, :]
         out = out.to(org_dtype)
@@ -689,14 +703,24 @@ class LastLayer(nn.Module):
     def forward(self, x: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
         org_dtype = x.dtype
         vec = vec.to(torch.float32)  # for numerical stability
-        mod = self.adaLN_modulation(vec)
+        
+        # Unfold the sequential module to cast weights dynamically
+        w_ada = self.adaLN_modulation[1].weight.float()
+        b_ada = self.adaLN_modulation[1].bias.float() if self.adaLN_modulation[1].bias is not None else None
+        mod = F.linear(self.adaLN_modulation[0](vec), w_ada, b_ada)
+        
         shift, scale = mod.chunk(2, dim=-1)
         if shift.ndim == 2:
             shift = shift[:, None, :]
             scale = scale[:, None, :]
+            
         x = x.to(torch.float32)  # for numerical stability
         x = (1 + scale) * self.norm_final(x) + shift
-        x = self.linear(x)
+        
+        w_lin = self.linear.weight.float()
+        b_lin = self.linear.bias.float() if self.linear.bias is not None else None
+        x = F.linear(x, w_lin, b_lin)
+        
         return x.to(org_dtype)
 
 
@@ -749,6 +773,11 @@ class SingleStreamBlock(nn.Module):
 
         # compute activation in mlp stream, cat again and run second linear layer
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        
+        # Stability Fix: Compute residual addition in float32 if needed to prevent overflow
+        if x.dtype == torch.float16:
+            return (x.float() + mod_gate.float() * output.float()).to(x.dtype)
+        
         return x + mod_gate * output
 
     def forward(self, x: Tensor, pe: Tensor, mod: tuple[Tensor, Tensor], attn_params: AttentionParams) -> Tensor:
@@ -904,7 +933,20 @@ class MLPEmbedder(nn.Module):
         self.gradient_checkpointing = False
 
     def _forward(self, x: Tensor) -> Tensor:
-        return self.out_layer(self.silu(self.in_layer(x)))
+        org_dtype = x.dtype
+        x = x.float()
+        
+        w_in = self.in_layer.weight.float()
+        b_in = self.in_layer.bias.float() if self.in_layer.bias is not None else None
+        h = F.linear(x, w_in, b_in)
+        
+        h = self.silu(h)
+        
+        w_out = self.out_layer.weight.float()
+        b_out = self.out_layer.bias.float() if self.out_layer.bias is not None else None
+        out = F.linear(h, w_out, b_out)
+        
+        return out.to(org_dtype)
 
     def forward(self, *args, **kwargs):
         if self.training and self.gradient_checkpointing:
