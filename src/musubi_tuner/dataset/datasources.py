@@ -792,9 +792,17 @@ class ImageTarDatasource(ImageDatasource):
         return self
 
     def __next__(self) -> callable:
-        if self.current_idx >= len(self.image_members):
+        if self.current_idx >= len(self.image_members):  # Note: use self.video_members in VideoTarDatasource
             raise StopIteration
-        fetcher = (lambda: self.get_caption(self.current_idx)) if self.caption_only else (lambda: self.get_image_data(self.current_idx))
+            
+        # Capture the current index immediately
+        idx = self.current_idx
+        
+        if self.caption_only:
+            fetcher = lambda i=idx: self.get_caption(i)
+        else:
+            fetcher = lambda i=idx: self.get_image_data(i)
+            
         self.current_idx += 1
         return fetcher
 
@@ -886,9 +894,17 @@ class VideoTarDatasource(VideoDatasource):
         self.current_idx = 0
         return self
 
-    def __next__(self):
-        if self.current_idx >= len(self.video_members):
+    def __next__(self) -> callable:
+        if self.current_idx >= len(self.video_members):  # Note: use self.video_members in VideoTarDatasource
             raise StopIteration
-        fetcher = (lambda: self.get_caption(self.current_idx)) if self.caption_only else (lambda: self.get_video_data(self.current_idx))
+            
+        # Capture the current index immediately
+        idx = self.current_idx
+        
+        if self.caption_only:
+            fetcher = lambda i=idx: self.get_caption(i)
+        else:
+            fetcher = lambda i=idx: self.get_video_data(i)
+            
         self.current_idx += 1
         return fetcher
