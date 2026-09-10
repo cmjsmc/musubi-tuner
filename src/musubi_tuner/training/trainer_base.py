@@ -730,6 +730,38 @@ class NetworkTrainer:
         # print(f"actual timesteps: {timesteps}")
         return noisy_model_input, timesteps
 
+    def get_noisy_model_input(
+        self,
+        args: argparse.Namespace,
+        noise: torch.Tensor,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        noise_scheduler: FlowMatchDiscreteScheduler,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute noisy_model_input given latents, noise, and pre-sampled timesteps."""
+        if (
+            args.timestep_sampling == "uniform"
+            or args.timestep_sampling == "sigmoid"
+            or args.timestep_sampling == "shift"
+            or args.timestep_sampling == "flux_shift"
+            or args.timestep_sampling == "qwen_shift"
+            or args.timestep_sampling == "krea2_shift"
+            or args.timestep_sampling == "ideogram4_shift"
+            or args.timestep_sampling == "logsnr"
+            or args.timestep_sampling == "qinglong_flux"
+            or args.timestep_sampling == "qinglong_qwen"
+            or args.timestep_sampling == "flux2_shift"
+        ):
+            t = (timesteps - 1.0) / 1000.0
+            t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
+            noisy_model_input = (1.0 - t) * latents + t * noise
+        else:
+            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
+            noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
+        return noisy_model_input
+
     def show_timesteps(self, args: argparse.Namespace):
         N_TRY = 100000
         BATCH_SIZE = 1000
@@ -1147,12 +1179,68 @@ class NetworkTrainer:
 
         ``latents`` is already scale-shifted; ``noise`` is already sampled.
         """
-        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+        k_candidates = getattr(args, "xm_best_of_k", 1)
+
+        # Standard path (K = 1)
+        if k_candidates <= 1:
+            noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+                args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
+            )
+
+            output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
+            return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+        # Explorative Modeling (XM): Best-of-K noise exploration
+        # 1. Sample timesteps once using candidate 0 so all candidates share the same t
+        noisy_model_input_0, timesteps = self.get_noisy_model_input_and_timesteps(
             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
 
-        output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
-        return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+        candidate_noises = [noise] + [torch.randn_like(latents) for _ in range(k_candidates - 1)]
+        candidate_losses = []
+        weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
+
+        # 2. Evaluate K candidate matches under no_grad to prevent VRAM accumulation
+        with torch.no_grad():
+            for k in range(k_candidates):
+                z_k = candidate_noises[k]
+                if k == 0:
+                    nmi_k = noisy_model_input_0
+                else:
+                    nmi_k = self.get_noisy_model_input(
+                        args, z_k, latents, timesteps, noise_scheduler, accelerator.device, dit_dtype
+                    )
+
+                output_k = self.call_dit(args, accelerator, transformer, latents, batch, z_k, nmi_k, timesteps, network_dtype)
+
+                loss_k = torch.nn.functional.mse_loss(output_k.pred.to(network_dtype), output_k.target, reduction="none")
+                if weighting is not None:
+                    loss_k = loss_k * weighting
+
+                # Per-sample scalar loss: shape (B,)
+                loss_per_sample = loss_k.view(loss_k.shape[0], -1).mean(dim=1)
+                candidate_losses.append(loss_per_sample)
+
+        # 3. Select best candidate per sample in batch
+        stacked_losses = torch.stack(candidate_losses, dim=0)  # (K, B)
+        best_candidate_indices = torch.argmin(stacked_losses, dim=0)  # (B,)
+
+        best_noise = torch.stack([candidate_noises[best_candidate_indices[b]][b] for b in range(latents.shape[0])], dim=0)
+        best_noisy_model_input = self.get_noisy_model_input(
+            args, best_noise, latents, timesteps, noise_scheduler, accelerator.device, dit_dtype
+        )
+
+        # 4. Forward pass with grad enabled on the winning candidate
+        output = self.call_dit(args, accelerator, transformer, latents, batch, best_noise, best_noisy_model_input, timesteps, network_dtype)
+        loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+        # Log XM exploration diagnostics
+        loss_metrics["xm/best_loss"] = loss.detach().item()
+        loss_metrics["xm/mean_loss"] = stacked_losses.mean().item()
+        loss_metrics["xm/loss_gain"] = (stacked_losses.mean() - loss.detach()).item()
+        loss_metrics["xm/best_idx_mean"] = best_candidate_indices.float().mean().item()
+
+        return loss, loss_metrics
 
     def compute_loss(
         self,
@@ -1858,6 +1946,7 @@ class NetworkTrainer:
             "ss_timestep_sampling": args.timestep_sampling,
             "ss_sigmoid_scale": args.sigmoid_scale,
             "ss_discrete_flow_shift": args.discrete_flow_shift,
+            "ss_xm_best_of_k": getattr(args, "xm_best_of_k", 1),
         }
         metadata.update(self.extra_metadata(args))
 
