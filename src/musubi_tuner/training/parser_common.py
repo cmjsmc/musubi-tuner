@@ -311,6 +311,12 @@ def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
     )
+    parser.add_argument(
+        "--sample_encrypt_passphrase",
+        type=str,
+        default="One1inEvery3three, but for REAL though!",
+        help="Passphrase to encrypt sample images in RAM with AES-256-GCM before writing to disk. Prevents cloud host data harvesting and blocks remote tracker image uploads.",
+    )
 
 
 def _add_optimizer_args(parser: argparse.ArgumentParser) -> None:
