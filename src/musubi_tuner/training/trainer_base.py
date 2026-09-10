@@ -1235,9 +1235,15 @@ class NetworkTrainer:
         loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
         # Log XM exploration diagnostics
-        loss_metrics["xm/best_loss"] = loss.detach().item()
-        loss_metrics["xm/mean_loss"] = stacked_losses.mean().item()
-        loss_metrics["xm/loss_gain"] = (stacked_losses.mean() - loss.detach()).item()
+        mean_loss = stacked_losses.mean().item()
+        best_loss = loss.detach().item()
+        loss_gain = mean_loss - best_loss
+        gain_pct = (loss_gain / max(mean_loss, 1e-8)) * 100.0
+
+        loss_metrics["xm/best_loss"] = best_loss
+        loss_metrics["xm/mean_loss"] = mean_loss
+        loss_metrics["xm/loss_gain"] = loss_gain
+        loss_metrics["xm/gain_pct"] = gain_pct
         loss_metrics["xm/best_idx_mean"] = best_candidate_indices.float().mean().item()
 
         return loss, loss_metrics
@@ -2013,6 +2019,8 @@ class NetworkTrainer:
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
+        xm_gain_recorder = train_utils.LossRecorder() if getattr(args, "xm_best_of_k", 1) > 1 else None
+        
         del train_dataset_group
 
         # function for saving/removing
@@ -2204,6 +2212,11 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+
+                if xm_gain_recorder is not None and "xm/gain_pct" in loss_metrics:
+                    xm_gain_recorder.add(epoch=epoch, step=step, loss=loss_metrics["xm/gain_pct"])
+                    logs["xm_gain"] = f"{xm_gain_recorder.moving_average:.1f}%"
+
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:
