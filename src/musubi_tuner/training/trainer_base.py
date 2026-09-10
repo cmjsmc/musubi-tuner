@@ -107,6 +107,10 @@ class NetworkTrainer:
         self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
 
+        self.t_bucket_names = [f"t_{i*200:03d}_{(i+1)*200:03d}" for i in range(5)]
+        self.t_bucket_loss_recorders = [train_utils.LossRecorder() for _ in range(5)]
+        self.t_bucket_xm_recorders = [train_utils.LossRecorder() for _ in range(5)]
+
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
         self,
@@ -1254,6 +1258,19 @@ class NetworkTrainer:
         loss_metrics["xm/loss_gain"] = loss_gain
         loss_metrics["xm/gain_pct"] = gain_pct
         loss_metrics["xm/best_idx_mean"] = float(sum(best_candidate_indices)) / bsz
+
+        mean_t = timesteps.mean().item()
+        bucket_idx = min(max(int(mean_t // 200), 0), 4)
+        bucket_name = self.t_bucket_names[bucket_idx]
+
+        # Record this step's loss in its specific bucket
+        self.t_bucket_loss_recorders[bucket_idx].add(epoch=0, step=global_step, loss=best_loss)
+        loss_metrics[f"loss/{bucket_name}"] = self.t_bucket_loss_recorders[bucket_idx].moving_average
+
+        # If XM was active on this step, record bucketed XM gain
+        if "xm/gain_pct" in loss_metrics:
+            self.t_bucket_xm_recorders[bucket_idx].add(epoch=0, step=global_step, loss=loss_metrics["xm/gain_pct"])
+            loss_metrics[f"xm_gain/{bucket_name}"] = self.t_bucket_xm_recorders[bucket_idx].moving_average
 
         return loss, loss_metrics
 
