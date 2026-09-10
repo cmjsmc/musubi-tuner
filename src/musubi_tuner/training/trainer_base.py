@@ -1181,7 +1181,7 @@ class NetworkTrainer:
         """
         k_candidates = getattr(args, "xm_best_of_k", 1)
 
-        # Standard path (K = 1)
+        # Standard baseline path (K <= 1)
         if k_candidates <= 1:
             noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
                 args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
@@ -1190,8 +1190,12 @@ class NetworkTrainer:
             output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
             return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
+        # =====================================================================
         # Explorative Modeling (XM): Best-of-K noise exploration
-        # 1. Sample timesteps once using candidate 0 so all candidates share the same t
+        # =====================================================================
+        bsz = latents.shape[0]
+
+        # 1. Sample timesteps once using candidate 0 so all candidates share identical t
         noisy_model_input_0, timesteps = self.get_noisy_model_input_and_timesteps(
             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
@@ -1200,7 +1204,9 @@ class NetworkTrainer:
         candidate_losses = []
         weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
 
-        # 2. Evaluate K candidate matches under no_grad to prevent VRAM accumulation
+        # 2. Evaluate K candidate matches under no_grad to prevent VRAM accumulation.
+        # Note: We keep network in its natural training mode so arbitrary network_module
+        # and network_args (DoRA, LyCORIS, DDP, etc.) preserve their internal states.
         with torch.no_grad():
             for k in range(k_candidates):
                 z_k = candidate_noises[k]
@@ -1218,19 +1224,22 @@ class NetworkTrainer:
                     loss_k = loss_k * weighting
 
                 # Per-sample scalar loss: shape (B,)
-                loss_per_sample = loss_k.view(loss_k.shape[0], -1).mean(dim=1)
+                loss_per_sample = loss_k.view(bsz, -1).mean(dim=1)
                 candidate_losses.append(loss_per_sample)
+
+        # Free temporary candidate tensors before running the backprop pass
+        del output_k, loss_k
 
         # 3. Select best candidate per sample in batch
         stacked_losses = torch.stack(candidate_losses, dim=0)  # (K, B)
-        best_candidate_indices = torch.argmin(stacked_losses, dim=0)  # (B,)
+        best_candidate_indices = torch.argmin(stacked_losses, dim=0).tolist()  # Python ints to avoid indexing bugs
 
-        best_noise = torch.stack([candidate_noises[best_candidate_indices[b]][b] for b in range(latents.shape[0])], dim=0)
+        best_noise = torch.stack([candidate_noises[best_candidate_indices[b]][b] for b in range(bsz)], dim=0)
         best_noisy_model_input = self.get_noisy_model_input(
             args, best_noise, latents, timesteps, noise_scheduler, accelerator.device, dit_dtype
         )
 
-        # 4. Forward pass with grad enabled on the winning candidate
+        # 4. Backward-enabled forward pass on the winning candidate
         output = self.call_dit(args, accelerator, transformer, latents, batch, best_noise, best_noisy_model_input, timesteps, network_dtype)
         loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
@@ -1244,7 +1253,7 @@ class NetworkTrainer:
         loss_metrics["xm/mean_loss"] = mean_loss
         loss_metrics["xm/loss_gain"] = loss_gain
         loss_metrics["xm/gain_pct"] = gain_pct
-        loss_metrics["xm/best_idx_mean"] = best_candidate_indices.float().mean().item()
+        loss_metrics["xm/best_idx_mean"] = float(sum(best_candidate_indices)) / bsz
 
         return loss, loss_metrics
 
