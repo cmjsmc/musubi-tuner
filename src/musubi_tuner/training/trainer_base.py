@@ -1040,6 +1040,7 @@ class NetworkTrainer:
             if encrypt_passphrase:
                 # >>> IN-RAM ENCRYPTION: Never write raw pixels to disk >>>
                 import io
+                from PIL import Image
                 from torchvision.utils import make_grid
                 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
                 from cryptography.hazmat.primitives import hashes
