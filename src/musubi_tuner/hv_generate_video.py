@@ -132,6 +132,7 @@ def save_images_grid(
     n_rows: int = 1,
     create_subdir: bool = True,
     encrypt_passphrase: Optional[str] = None,
+    webp_quality: int = 90,
 ) -> list[str]:
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
@@ -155,18 +156,17 @@ def save_images_grid(
         image = Image.fromarray(x)
 
         if encrypt_passphrase:
-            # Render PNG into RAM buffer and encrypt directly with AES-256-GCM
             import io
-            image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.png.enc")
+            image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.webp.enc")
             buf = io.BytesIO()
-            image.save(buf, format="PNG")
+            image.save(buf, format="WEBP", quality=webp_quality, method=6)
             encrypted_bytes = encrypt_payload(buf.getvalue(), encrypt_passphrase)
             with open(image_path, "wb") as f:
                 f.write(encrypted_bytes)
-            logger.info(f"Encrypted sample saved to: {image_path}")
+            logger.info(f"Sample encrypted as WebP (AES-256-GCM) and saved to: {image_path}")
         else:
-            image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.png")
-            image.save(image_path)
+            image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.webp")
+            image.save(image_path, format="WEBP", quality=webp_quality, method=5)
 
         image_paths.append(image_path)
 
