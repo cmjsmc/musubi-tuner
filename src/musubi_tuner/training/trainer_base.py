@@ -66,7 +66,7 @@ from musubi_tuner.training.timesteps import (
 )
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
@@ -957,26 +957,26 @@ class NetworkTrainer:
             torch.cuda.seed()
             generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
 
-        logger.info(f"prompt: {prompt}")
-        logger.info(f"height: {height}")
-        logger.info(f"width: {width}")
-        logger.info(f"frame count: {frame_count}")
-        logger.info(f"sample steps: {sample_steps}")
-        logger.info(f"guidance scale: {guidance_scale}")
-        logger.info(f"discrete flow shift: {discrete_flow_shift}")
-        if seed is not None:
-            logger.info(f"seed: {seed}")
+        # logger.info(f"prompt: {prompt}")
+        # logger.info(f"height: {height}")
+        # logger.info(f"width: {width}")
+        # logger.info(f"frame count: {frame_count}")
+        # logger.info(f"sample steps: {sample_steps}")
+        # logger.info(f"guidance scale: {guidance_scale}")
+        # logger.info(f"discrete flow shift: {discrete_flow_shift}")
+        # if seed is not None:
+        #     logger.info(f"seed: {seed}")
 
         do_classifier_free_guidance = False
         if negative_prompt is not None:
             do_classifier_free_guidance = True
-            logger.info(f"negative prompt: {negative_prompt}")
-            logger.info(f"cfg scale: {cfg_scale}")
+            # logger.info(f"negative prompt: {negative_prompt}")
+            # logger.info(f"cfg scale: {cfg_scale}")
 
-        if self.i2v_training:
-            logger.info(f"image path: {image_path}")
-        if self.control_training:
-            logger.info(f"control video path: {control_video_path}")
+        # if self.i2v_training:
+        #     logger.info(f"image path: {image_path}")
+        # if self.control_training:
+        #     logger.info(f"control video path: {control_video_path}")
 
         # inference: architecture dependent
         # Check if transformer has self-referencing _orig_mod (compiled model hack)
