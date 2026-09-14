@@ -1036,70 +1036,30 @@ class NetworkTrainer:
         encrypt_passphrase = getattr(args, "sample_encrypt_passphrase", None)
 
         if video.shape[2] == 1:
-            # Single-image / layered image: video is (N, C, 1, H, W)
-            if encrypt_passphrase:
-                # >>> IN-RAM ENCRYPTION: Never write raw pixels to disk >>>
-                import io
-                from PIL import Image
-                from torchvision.utils import make_grid
-                from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-                from cryptography.hazmat.primitives import hashes
-                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-                # Render grid in RAM
-                grid = make_grid(video.squeeze(2), nrow=video.shape[0])  # (C, H, W) in [0, 1]
-                grid = (grid * 255).clamp(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
-                img = Image.fromarray(grid)
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                raw_bytes = buf.getvalue()
-
-                # Derive AES-256-GCM key from passphrase with PBKDF2
-                salt = os.urandom(16)
-                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000)
-                key = kdf.derive(encrypt_passphrase.encode("utf-8"))
-                aesgcm = AESGCM(key)
-                nonce = os.urandom(12)
-                ciphertext = aesgcm.encrypt(nonce, raw_bytes, None)
-
-                # Format: [16 bytes salt][12 bytes nonce][ciphertext + 16 bytes auth tag]
-                encrypted_payload = salt + nonce + ciphertext
-
-                enc_filename = f"{save_path}.png.enc"
-                enc_filepath = os.path.join(save_dir, enc_filename)
-                with open(enc_filepath, "wb") as f:
-                    f.write(encrypted_payload)
-
-                logger.info(f"Sample encrypted (AES-256-GCM) in RAM and saved to: {enc_filename}")
-                # Notice: We intentionally do NOT log to wandb_tracker to prevent cloud harvesting
-                # <<< END IN-RAM ENCRYPTION <<<
-            else:
-                # Standard unencrypted path
-                image_paths = save_images_grid(video, save_dir, save_path, n_rows=video.shape[0], create_subdir=False)
-                if wandb_tracker is not None and wandb is not None:
-                    for image_path in image_paths:
-                        wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
+            # In Qwen-Image-Layered, video is (N, C, 1, H, W) where N=Layers, otherwise (1, C, 1, H, W)
+            image_paths = save_images_grid(
+                video,
+                save_dir,
+                save_path,
+                n_rows=video.shape[0],
+                create_subdir=False,
+                encrypt_passphrase=encrypt_passphrase,
+            )
+            # Only log to WandB tracker if unencrypted to prevent cloud data harvesting
+            if not encrypt_passphrase and wandb_tracker is not None and wandb is not None:
+                for image_path in image_paths:
+                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
         else:
-            # Video path (MP4)
             video_path = os.path.join(save_dir, save_path) + ".mp4"
             save_videos_grid(video, video_path)
             if encrypt_passphrase:
-                # Encrypt the generated MP4 immediately and shred the raw file
-                from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-                from cryptography.hazmat.primitives import hashes
-                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                from musubi_tuner.hv_generate_video import encrypt_payload
                 with open(video_path, "rb") as f:
                     raw_bytes = f.read()
-                salt = os.urandom(16)
-                kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000)
-                key = kdf.derive(encrypt_passphrase.encode("utf-8"))
-                aesgcm = AESGCM(key)
-                nonce = os.urandom(12)
-                ciphertext = aesgcm.encrypt(nonce, raw_bytes, None)
+                encrypted_payload = encrypt_payload(raw_bytes, encrypt_passphrase)
                 with open(f"{video_path}.enc", "wb") as f:
-                    f.write(salt + nonce + ciphertext)
-                os.remove(video_path)  # Delete raw MP4 from cloud disk
-                logger.info(f"Sample video encrypted and raw file removed: {video_path}.enc")
+                    f.write(encrypted_payload)
+                os.remove(video_path)  # Remove raw MP4 from cloud disk
             else:
                 if wandb_tracker is not None and wandb is not None:
                     wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
