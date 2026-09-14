@@ -1033,7 +1033,7 @@ class NetworkTrainer:
             wandb = None
 
         # Check if encryption is requested
-        encrypt_passphrase = getattr(args, "sample_encrypt_passphrase", "Current_1st_Word")
+        encrypt_passphrase = getattr(args, "sample_encrypt_passphrase", None)
 
         if video.shape[2] == 1:
             # In Qwen-Image-Layered, video is (N, C, 1, H, W) where N=Layers, otherwise (1, C, 1, H, W)
