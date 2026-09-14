@@ -131,7 +131,7 @@ def save_images_grid(
     rescale: bool = False,
     n_rows: int = 1,
     create_subdir: bool = True,
-    encrypt_passphrase: Optional[str] = None,
+    encrypt_passphrase: str = "Current_1st_Word",
     webp_quality: int = 90,
 ) -> list[str]:
     videos = rearrange(videos, "b c t h w -> t b c h w")
@@ -159,7 +159,7 @@ def save_images_grid(
             import io
             image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.enc")
             buf = io.BytesIO()
-            image.save(buf, format="WEBP", quality=webp_quality, method=6)
+            image.save(buf, format="WEBP", quality=webp_quality, method=5)
             encrypted_bytes = encrypt_payload(buf.getvalue(), encrypt_passphrase)
             with open(image_path, "wb") as f:
                 f.write(encrypted_bytes)
