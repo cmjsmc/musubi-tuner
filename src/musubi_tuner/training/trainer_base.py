@@ -1175,6 +1175,34 @@ class NetworkTrainer:
     # Internal extension points — no API stability guarantees.
     # Subclasses live in this repo; if you fork, expect breakage on updates.
 
+    def get_xm_k(self, args: argparse.Namespace, timestep: float) -> int:
+        """Resolve K for Explorative Modeling at the current timestep based on --xm_schedule."""
+        if not hasattr(self, "_parsed_xm_schedule"):
+            schedule_str = getattr(args, "xm_schedule", None)
+            if schedule_str:
+                parsed = []
+                for part in schedule_str.split(","):
+                    part = part.strip()
+                    if not part or ":" not in part:
+                        continue
+                    t_str, k_str = part.split(":", 1)
+                    parsed.append((float(t_str.strip()), int(k_str.strip())))
+                parsed.sort(key=lambda x: x[0])
+                self._parsed_xm_schedule = parsed
+            else:
+                self._parsed_xm_schedule = None
+
+        if self._parsed_xm_schedule:
+            k = 1
+            for t_thresh, k_val in self._parsed_xm_schedule:
+                if timestep >= t_thresh:
+                    k = k_val
+                else:
+                    break
+            return max(k, 1)
+
+        return max(getattr(args, "xm_best_of_k", 1), 1)
+        
     def process_batch(
         self,
         args: argparse.Namespace,
@@ -1190,33 +1218,6 @@ class NetworkTrainer:
         vae,
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute scalar loss for one training batch (pre-backward).
-
-        Default implementation: vanilla flow matching, delegating the loss
-        formulation itself to ``compute_loss``. Override either method:
-        ``process_batch`` to change what gets fed to the model (Self-Flow's
-        dual-timestep dance, etc.), or ``compute_loss`` to swap the loss
-        formulation while keeping the standard data flow.
-
-        Returns ``(scalar_loss, loss_metrics)`` — ``loss_metrics`` is merged
-        into the per-step log dict alongside ``extra_step_logs``.
-
-        ``latents`` is already scale-shifted; ``noise`` is already sampled.
-        """
-        k_candidates = getattr(args, "xm_best_of_k", 1)
-
-        # Standard baseline path (K <= 1)
-        if k_candidates <= 1:
-            noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
-                args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
-            )
-
-            output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
-            return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
-
-        # =====================================================================
-        # Explorative Modeling (XM): Best-of-K noise exploration
-        # =====================================================================
         bsz = latents.shape[0]
 
         # 1. Sample timesteps once using candidate 0 so all candidates share identical t
@@ -1224,13 +1225,23 @@ class NetworkTrainer:
             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
 
+        # Dynamically resolve K for this specific batch's timestep
+        mean_t = timesteps.mean().item()
+        k_candidates = self.get_xm_k(args, mean_t)
+
+        # Standard baseline path (if scheduled K <= 1, skip all candidate loops and save compute)
+        if k_candidates <= 1:
+            output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input_0, timesteps, network_dtype)
+            return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+        # =====================================================================
+        # Explorative Modeling (XM): Best-of-K noise exploration
+        # =====================================================================
         candidate_noises = [noise] + [torch.randn_like(latents) for _ in range(k_candidates - 1)]
         candidate_losses = []
         weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
 
-        # 2. Evaluate K candidate matches under no_grad to prevent VRAM accumulation.
-        # Note: We keep network in its natural training mode so arbitrary network_module
-        # and network_args (DoRA, LyCORIS, DDP, etc.) preserve their internal states.
+        # 2. Evaluate K candidate matches under no_grad to prevent VRAM accumulation
         with torch.no_grad():
             for k in range(k_candidates):
                 z_k = candidate_noises[k]
@@ -1256,7 +1267,7 @@ class NetworkTrainer:
 
         # 3. Select best candidate per sample in batch
         stacked_losses = torch.stack(candidate_losses, dim=0)  # (K, B)
-        best_candidate_indices = torch.argmin(stacked_losses, dim=0).tolist()  # Python ints to avoid indexing bugs
+        best_candidate_indices = torch.argmin(stacked_losses, dim=0).tolist()
 
         best_noise = torch.stack([candidate_noises[best_candidate_indices[b]][b] for b in range(bsz)], dim=0)
         best_noisy_model_input = self.get_noisy_model_input(
@@ -1268,29 +1279,17 @@ class NetworkTrainer:
         loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
 
         # Log XM exploration diagnostics
-        mean_loss = stacked_losses.mean().item()
+        baseline_loss = candidate_losses[0].mean().item()
         best_loss = loss.detach().item()
-        loss_gain = mean_loss - best_loss
-        gain_pct = (loss_gain / max(mean_loss, 1e-8)) * 100.0
+        loss_gain = baseline_loss - best_loss
+        gain_pct = (loss_gain / max(baseline_loss, 1e-8)) * 100.0
 
+        loss_metrics["xm/active_k"] = k_candidates
         loss_metrics["xm/best_loss"] = best_loss
-        loss_metrics["xm/mean_loss"] = mean_loss
+        loss_metrics["xm/baseline_loss"] = baseline_loss
         loss_metrics["xm/loss_gain"] = loss_gain
         loss_metrics["xm/gain_pct"] = gain_pct
         loss_metrics["xm/best_idx_mean"] = float(sum(best_candidate_indices)) / bsz
-
-        mean_t = timesteps.mean().item()
-        bucket_idx = min(max(int(mean_t // 200), 0), 4)
-        bucket_name = self.t_bucket_names[bucket_idx]
-
-        # Record this step's loss in its specific bucket
-        self.t_bucket_loss_recorders[bucket_idx].add(epoch=0, step=global_step, loss=best_loss)
-        loss_metrics[f"loss/{bucket_name}"] = self.t_bucket_loss_recorders[bucket_idx].moving_average
-
-        # If XM was active on this step, record bucketed XM gain
-        if "xm/gain_pct" in loss_metrics:
-            self.t_bucket_xm_recorders[bucket_idx].add(epoch=0, step=global_step, loss=loss_metrics["xm/gain_pct"])
-            loss_metrics[f"xm_gain/{bucket_name}"] = self.t_bucket_xm_recorders[bucket_idx].moving_average
 
         return loss, loss_metrics
 
