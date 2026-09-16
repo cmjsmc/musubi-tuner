@@ -224,6 +224,13 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
         help="Explorative Modeling (XM): number of candidate noise samples to explore per training step (K >= 1). Default 1 (baseline / standard training)."
         " / 探索的モデリング (XM): 各訓練ステップで探索する候補ノイズの数 (K >= 1)。デフォルトは1 (ベースライン / 通常学習)。",
     )
+    parser.add_argument(
+        "--xm_schedule",
+        type=str,
+        default=None,
+        help="Dynamic piecewise timestep-to-K schedule for Explorative Modeling (e.g. '0:2, 250:3, 500:5, 950:2'). Overrides --xm_best_of_k if specified."
+        " / XMのタイムステップ別Kスケジュール（例: '0:2, 250:3, 500:5, 950:2'）。指定した場合、--xm_best_of_kを上書きします。",
+    )
 
 
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
