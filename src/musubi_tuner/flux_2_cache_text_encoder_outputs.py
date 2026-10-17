@@ -13,7 +13,7 @@ import logging
 
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def encode_and_save_batch(text_embedder: torch.nn.Module, batch: list[ItemInfo], device: torch.device, arch_full: str):

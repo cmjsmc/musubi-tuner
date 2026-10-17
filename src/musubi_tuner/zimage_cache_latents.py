@@ -19,7 +19,7 @@ from musubi_tuner.zimage.zimage_autoencoder import AutoencoderKL
 import musubi_tuner.cache_latents as cache_latents
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def preprocess_contents_zimage(batch: List[ItemInfo]) -> torch.Tensor:

@@ -43,7 +43,7 @@ from musubi_tuner.dataset.image_video_dataset import load_video, resize_image_to
 import logging
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def get_time_flag():
@@ -113,9 +113,29 @@ def save_videos_grid(videos: torch.Tensor, path: str, rescale=False, n_rows=1, f
 
     container.close()
 
+def encrypt_payload(data: bytes, passphrase: str) -> bytes:
+    """Encrypts raw bytes using AES-256-GCM authenticated encryption."""
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+    salt = os.urandom(16)
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100_000)
+    key = kdf.derive(passphrase.encode("utf-8"))
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ciphertext = aesgcm.encrypt(nonce, data, None)
+    return salt + nonce + ciphertext
+    
 def save_images_grid(
-    videos: torch.Tensor, parent_dir: str, image_name: str, rescale: bool = False, n_rows: int = 1, create_subdir=True
+    videos: torch.Tensor,
+    parent_dir: str,
+    image_name: str,
+    rescale: bool = False,
+    n_rows: int = 1,
+    create_subdir: bool = True,
+    encrypt_passphrase: str = "Current_1st_Word",
+    webp_quality: int = 90,
 ) -> list[str]:
     videos = rearrange(videos, "b c t h w -> t b c h w")
     outputs = []
@@ -136,16 +156,26 @@ def save_images_grid(
     os.makedirs(output_dir, exist_ok=True)
     image_paths = []
     for i, x in enumerate(outputs):
-        image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.png")
-        image_paths.append(image_path)
         image = Image.fromarray(x)
-        image.save(image_path)
+
+        if encrypt_passphrase:
+            import io
+            image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.enc")
+            buf = io.BytesIO()
+            image.save(buf, format="WEBP", quality=webp_quality, method=5)
+            encrypted_bytes = encrypt_payload(buf.getvalue(), encrypt_passphrase)
+            with open(image_path, "wb") as f:
+                f.write(encrypted_bytes)
+        else:
+            # Standard save as .png
+            image_path = os.path.join(output_dir, f"{image_name}_{i:03d}.png")
+            image.save(image_path)
+
+        image_paths.append(image_path)
 
     return image_paths
 
-
 # region Encoding prompt
-
 
 def encode_prompt(prompt: Union[str, list[str]], device: torch.device, num_videos_per_prompt: int, text_encoder: TextEncoder):
     r"""
@@ -571,7 +601,7 @@ def main():
                     metadata = f.metadata()
                 if metadata is None:
                     metadata = {}
-                logger.info(f"Loaded metadata: {metadata}")
+                # logger.info(f"Loaded metadata: {metadata}")
 
                 if "seeds" in metadata:
                     seed = int(metadata["seeds"])
@@ -579,7 +609,7 @@ def main():
             seeds.append(seed)
             latents_list.append(latents)
 
-            logger.info(f"Loaded latent from {latent_path}. Shape: {latents.shape}")
+            # logger.info(f"Loaded latent from {latent_path}. Shape: {latents.shape}")
         latents = torch.stack(latents_list, dim=0)
     else:
         # prepare accelerator
@@ -594,7 +624,7 @@ def main():
         height, width, video_length = check_inputs(args)
 
         # encode prompt with LLM and Text Encoder
-        logger.info(f"Encoding prompt: {prompt}")
+        # logger.info(f"Encoding prompt: {prompt}")
 
         do_classifier_free_guidance = args.guidance_scale != 1.0
         if do_classifier_free_guidance:
@@ -602,7 +632,7 @@ def main():
             if negative_prompt is None:
                 logger.info("Negative prompt is not provided, using empty prompt")
                 negative_prompt = ""
-            logger.info(f"Encoding negative prompt: {negative_prompt}")
+            # logger.info(f"Encoding negative prompt: {negative_prompt}")
             prompt = [negative_prompt, prompt]
         else:
             if args.negative_prompt is not None:
@@ -943,7 +973,7 @@ def main():
             sd = {"latent": latent}
             save_file(sd, latent_path, metadata=metadata)
 
-            logger.info(f"Latent save to: {latent_path}")
+            # logger.info(f"Latent save to: {latent_path}")
     if output_type == "video" or output_type == "both":
         # save video
         videos = decode_latents(args, latents, device)
@@ -952,7 +982,7 @@ def main():
             sample = sample.unsqueeze(0)
             video_path = f"{save_path}/{time_flag}_{i}_{seeds[i]}{original_name}.mp4"
             save_videos_grid(sample, video_path, fps=args.fps)
-            logger.info(f"Sample save to: {video_path}")
+            # logger.info(f"Sample save to: {video_path}")
     elif output_type == "images":
         # save images
         videos = decode_latents(args, latents, device)
@@ -961,7 +991,7 @@ def main():
             sample = sample.unsqueeze(0)
             image_name = f"{time_flag}_{i}_{seeds[i]}{original_name}"
             save_images_grid(sample, save_path, image_name)
-            logger.info(f"Sample images save to: {save_path}/{image_name}")
+            # logger.info(f"Sample images save to: {save_path}/{image_name}")
 
     logger.info("Done!")
 

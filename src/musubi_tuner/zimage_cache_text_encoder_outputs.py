@@ -18,7 +18,7 @@ from musubi_tuner.zimage import zimage_utils
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def encode_and_save_batch(tokenizer, text_encoder, batch: list[ItemInfo], device: torch.device):

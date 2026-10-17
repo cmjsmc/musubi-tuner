@@ -18,7 +18,7 @@ from musubi_tuner.hunyuan_model.autoencoder_kl_causal_3d import AutoencoderKLCau
 from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def show_image(
@@ -392,11 +392,12 @@ def setup_parser_common(*, include_vae: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset_config", type=str, required=True, help="path to dataset config .toml file")
+    parser.add_argument(
+        "--dataset_passphrase", type=str, default=None, help="passphrase for encrypted dataset archives (.tar.gz.gpg)"
+    )
     if include_vae:
         parser.add_argument("--vae", type=str, required=False, default=None, help="path to vae checkpoint")
-        parser.add_argument(
-            "--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model, e.g., float16"
-        )
+        parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model, e.g., float16")
     parser.add_argument("--device", type=str, default=None, help="device to use, default is cuda if available")
     parser.add_argument(
         "--batch_size", type=int, default=None, help="batch size, override dataset config if dataset batch size > this"

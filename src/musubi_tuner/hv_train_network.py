@@ -141,7 +141,7 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
     ):
         text_encoder1, text_encoder2, fp8_llm = args.text_encoder1, args.text_encoder2, args.fp8_llm
 
-        logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
+        # logger.info(f"cache Text Encoder outputs for sample prompt: {sample_prompts}")
         prompts = load_prompts(sample_prompts)
 
         def encode_for_text_encoder(text_encoder, is_llm=True):
@@ -152,7 +152,7 @@ class HunyuanVideoNetworkTrainer(NetworkTrainer):
                         if p is None:
                             continue
                         if p not in sample_prompts_te_outputs:
-                            logger.info(f"cache Text Encoder outputs for prompt: {p}")
+                            # logger.info(f"cache Text Encoder outputs for prompt: {p}")
 
                             data_type = "video"
                             text_inputs = text_encoder.text2tokens(p, data_type=data_type)

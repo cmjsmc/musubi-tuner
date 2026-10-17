@@ -67,7 +67,7 @@ from musubi_tuner.training.timesteps import (
 )
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 SS_METADATA_KEY_BASE_MODEL_VERSION = "ss_base_model_version"
@@ -147,6 +147,10 @@ class NetworkTrainer:
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
         self.vae_frame_stride = 4  # legacy frame-grid fallback; some architectures set 1 or use a custom formula
         self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
+
+        self.t_bucket_names = [f"t_{i*200:03d}_{(i+1)*200:03d}" for i in range(5)]
+        self.t_bucket_loss_recorders = [train_utils.LossRecorder() for _ in range(5)]
+        self.t_bucket_xm_recorders = [train_utils.LossRecorder() for _ in range(5)]
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -808,6 +812,38 @@ class NetworkTrainer:
         # print(f"actual timesteps: {timesteps}")
         return noisy_model_input, timesteps
 
+    def get_noisy_model_input(
+        self,
+        args: argparse.Namespace,
+        noise: torch.Tensor,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        noise_scheduler: FlowMatchDiscreteScheduler,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute noisy_model_input given latents, noise, and pre-sampled timesteps."""
+        if (
+            args.timestep_sampling == "uniform"
+            or args.timestep_sampling == "sigmoid"
+            or args.timestep_sampling == "shift"
+            or args.timestep_sampling == "flux_shift"
+            or args.timestep_sampling == "qwen_shift"
+            or args.timestep_sampling == "krea2_shift"
+            or args.timestep_sampling == "ideogram4_shift"
+            or args.timestep_sampling == "logsnr"
+            or args.timestep_sampling == "qinglong_flux"
+            or args.timestep_sampling == "qinglong_qwen"
+            or args.timestep_sampling == "flux2_shift"
+        ):
+            t = (timesteps - 1.0) / 1000.0
+            t = t.view(-1, 1, 1, 1, 1) if latents.ndim == 5 else t.view(-1, 1, 1, 1)
+            noisy_model_input = (1.0 - t) * latents + t * noise
+        else:
+            sigmas = get_sigmas(noise_scheduler, timesteps, device, n_dim=latents.ndim, dtype=dtype)
+            noisy_model_input = sigmas * noise + (1.0 - sigmas) * latents
+        return noisy_model_input
+
     def show_timesteps(self, args: argparse.Namespace):
         N_TRY = 100000
         BATCH_SIZE = 1000
@@ -1000,26 +1036,26 @@ class NetworkTrainer:
             torch.cuda.seed()
             generator = torch.Generator(device=device).manual_seed(torch.initial_seed())
 
-        logger.info(f"prompt: {prompt}")
-        logger.info(f"height: {height}")
-        logger.info(f"width: {width}")
-        logger.info(f"frame count: {frame_count}")
-        logger.info(f"sample steps: {sample_steps}")
-        logger.info(f"guidance scale: {guidance_scale}")
-        logger.info(f"discrete flow shift: {discrete_flow_shift}")
-        if seed is not None:
-            logger.info(f"seed: {seed}")
+        # logger.info(f"prompt: {prompt}")
+        # logger.info(f"height: {height}")
+        # logger.info(f"width: {width}")
+        # logger.info(f"frame count: {frame_count}")
+        # logger.info(f"sample steps: {sample_steps}")
+        # logger.info(f"guidance scale: {guidance_scale}")
+        # logger.info(f"discrete flow shift: {discrete_flow_shift}")
+        # if seed is not None:
+        #     logger.info(f"seed: {seed}")
 
         do_classifier_free_guidance = False
         if negative_prompt is not None:
             do_classifier_free_guidance = True
-            logger.info(f"negative prompt: {negative_prompt}")
-            logger.info(f"cfg scale: {cfg_scale}")
+            # logger.info(f"negative prompt: {negative_prompt}")
+            # logger.info(f"cfg scale: {cfg_scale}")
 
-        if self.i2v_training:
-            logger.info(f"image path: {image_path}")
-        if self.control_training:
-            logger.info(f"control video path: {control_video_path}")
+        # if self.i2v_training:
+        #     logger.info(f"image path: {image_path}")
+        # if self.control_training:
+        #     logger.info(f"control video path: {control_video_path}")
 
         # inference: architecture dependent
         # Check if transformer has self-referencing _orig_mod (compiled model hack)
@@ -1085,17 +1121,38 @@ class NetworkTrainer:
         """
         prompt_idx = sample_parameter.get("enum", 0)
         wandb_tracker, wandb = wandb_tracker_and_module(accelerator)
-        if sample.shape[2] == 1:
+        
+        # Check if encryption is requested
+        encrypt_passphrase = getattr(args, "sample_encrypt_passphrase", None)
+
+        if video.shape[2] == 1:
             # In Qwen-Image-Layered, video is (N, C, 1, H, W) where N=Layers, otherwise (1, C, 1, H, W)
-            image_paths = save_images_grid(sample, save_dir, save_path, n_rows=sample.shape[0], create_subdir=False)
-            if wandb_tracker is not None:
+            image_paths = save_images_grid(
+                sample,
+                save_dir,
+                save_path,
+                n_rows=video.shape[0],
+                create_subdir=False,
+                encrypt_passphrase=encrypt_passphrase,
+            )
+            # Only log to WandB tracker if unencrypted to prevent cloud data harvesting
+            if not encrypt_passphrase and wandb_tracker is not None and wandb is not None:
                 for image_path in image_paths:
                     wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
         else:
             video_path = os.path.join(save_dir, save_path) + ".mp4"
             save_videos_grid(sample, video_path)
-            if wandb_tracker is not None:
-                wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
+            if encrypt_passphrase:
+                from musubi_tuner.hv_generate_video import encrypt_payload
+                with open(video_path, "rb") as f:
+                    raw_bytes = f.read()
+                encrypted_payload = encrypt_payload(raw_bytes, encrypt_passphrase)
+                with open(f"{video_path}.enc", "wb") as f:
+                    f.write(encrypted_payload)
+                os.remove(video_path)  # Remove raw MP4 from cloud disk
+            else:
+                if wandb_tracker is not None and wandb is not None:
+                    wandb_tracker.log({f"sample_{prompt_idx}": wandb.Video(video_path)}, step=steps)
 
     # region model specific (abstract hooks — implemented by architecture-specific subclasses)
 
@@ -1230,6 +1287,34 @@ class NetworkTrainer:
     # Internal extension points — no API stability guarantees.
     # Subclasses live in this repo; if you fork, expect breakage on updates.
 
+    def get_xm_k(self, args: argparse.Namespace, timestep: float) -> int:
+        """Resolve K for Explorative Modeling at the current timestep based on --xm_schedule."""
+        if not hasattr(self, "_parsed_xm_schedule"):
+            schedule_str = getattr(args, "xm_schedule", None)
+            if schedule_str:
+                parsed = []
+                for part in schedule_str.split(","):
+                    part = part.strip()
+                    if not part or ":" not in part:
+                        continue
+                    t_str, k_str = part.split(":", 1)
+                    parsed.append((float(t_str.strip()), int(k_str.strip())))
+                parsed.sort(key=lambda x: x[0])
+                self._parsed_xm_schedule = parsed
+            else:
+                self._parsed_xm_schedule = None
+
+        if self._parsed_xm_schedule:
+            k = 1
+            for t_thresh, k_val in self._parsed_xm_schedule:
+                if timestep >= t_thresh:
+                    k = k_val
+                else:
+                    break
+            return max(k, 1)
+
+        return max(getattr(args, "xm_best_of_k", 1), 1)
+        
     def process_batch(
         self,
         args: argparse.Namespace,
@@ -1245,25 +1330,80 @@ class NetworkTrainer:
         sample_resources,
         global_step: int,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute scalar loss for one training batch (pre-backward).
+        bsz = latents.shape[0]
 
-        Default implementation: vanilla flow matching, delegating the loss
-        formulation itself to ``compute_loss``. Override either method:
-        ``process_batch`` to change what gets fed to the model (Self-Flow's
-        dual-timestep dance, etc.), or ``compute_loss`` to swap the loss
-        formulation while keeping the standard data flow.
-
-        Returns ``(scalar_loss, loss_metrics)`` — ``loss_metrics`` is merged
-        into the per-step log dict alongside ``extra_step_logs``.
-
-        ``latents`` is already scale-shifted; ``noise`` is already sampled.
-        """
-        noisy_model_input, timesteps = self.get_noisy_model_input_and_timesteps(
+        # 1. Sample timesteps once using candidate 0 so all candidates share identical t
+        noisy_model_input_0, timesteps = self.get_noisy_model_input_and_timesteps(
             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
 
-        output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input, timesteps, network_dtype)
-        return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+        # Dynamically resolve K for this specific batch's timestep
+        mean_t = timesteps.mean().item()
+        k_candidates = self.get_xm_k(args, mean_t)
+
+        # Standard baseline path (if scheduled K <= 1, skip all candidate loops and save compute)
+        if k_candidates <= 1:
+            output = self.call_dit(args, accelerator, transformer, latents, batch, noise, noisy_model_input_0, timesteps, network_dtype)
+            return self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+        # =====================================================================
+        # Explorative Modeling (XM): Best-of-K noise exploration
+        # =====================================================================
+        candidate_noises = [noise] + [torch.randn_like(latents) for _ in range(k_candidates - 1)]
+        candidate_losses = []
+        weighting = compute_loss_weighting_for_sd3(args.weighting_scheme, noise_scheduler, timesteps, timesteps.device, dit_dtype)
+
+        # 2. Evaluate K candidate matches under no_grad to prevent VRAM accumulation
+        with torch.no_grad():
+            for k in range(k_candidates):
+                z_k = candidate_noises[k]
+                if k == 0:
+                    nmi_k = noisy_model_input_0
+                else:
+                    nmi_k = self.get_noisy_model_input(
+                        args, z_k, latents, timesteps, noise_scheduler, accelerator.device, dit_dtype
+                    )
+
+                output_k = self.call_dit(args, accelerator, transformer, latents, batch, z_k, nmi_k, timesteps, network_dtype)
+
+                loss_k = torch.nn.functional.mse_loss(output_k.pred.to(network_dtype), output_k.target, reduction="none")
+                if weighting is not None:
+                    loss_k = loss_k * weighting
+
+                # Per-sample scalar loss: shape (B,)
+                loss_per_sample = loss_k.view(bsz, -1).mean(dim=1)
+                candidate_losses.append(loss_per_sample)
+
+        # Free temporary candidate tensors before running the backprop pass
+        del output_k, loss_k
+
+        # 3. Select best candidate per sample in batch
+        stacked_losses = torch.stack(candidate_losses, dim=0)  # (K, B)
+        best_candidate_indices = torch.argmin(stacked_losses, dim=0).tolist()
+
+        best_noise = torch.stack([candidate_noises[best_candidate_indices[b]][b] for b in range(bsz)], dim=0)
+        best_noisy_model_input = self.get_noisy_model_input(
+            args, best_noise, latents, timesteps, noise_scheduler, accelerator.device, dit_dtype
+        )
+
+        # 4. Backward-enabled forward pass on the winning candidate
+        output = self.call_dit(args, accelerator, transformer, latents, batch, best_noise, best_noisy_model_input, timesteps, network_dtype)
+        loss, loss_metrics = self.compute_loss(args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step)
+
+        # Log XM exploration diagnostics
+        baseline_loss = candidate_losses[0].mean().item()
+        best_loss = loss.detach().item()
+        loss_gain = baseline_loss - best_loss
+        gain_pct = (loss_gain / max(baseline_loss, 1e-8)) * 100.0
+
+        loss_metrics["xm/active_k"] = k_candidates
+        loss_metrics["xm/best_loss"] = best_loss
+        loss_metrics["xm/baseline_loss"] = baseline_loss
+        loss_metrics["xm/loss_gain"] = loss_gain
+        loss_metrics["xm/gain_pct"] = gain_pct
+        loss_metrics["xm/best_idx_mean"] = float(sum(best_candidate_indices)) / bsz
+
+        return loss, loss_metrics
 
     def compute_loss(
         self,
@@ -1995,6 +2135,7 @@ class NetworkTrainer:
             "ss_timestep_sampling": args.timestep_sampling,
             "ss_sigmoid_scale": args.sigmoid_scale,
             "ss_discrete_flow_shift": args.discrete_flow_shift,
+            "ss_xm_best_of_k": getattr(args, "xm_best_of_k", 1),
         }
         metadata.update(self.extra_metadata(args))
 
@@ -2062,6 +2203,8 @@ class NetworkTrainer:
         noise_scheduler = FlowMatchDiscreteScheduler(shift=args.discrete_flow_shift, reverse=True, solver="euler")
 
         loss_recorder = train_utils.LossRecorder()
+        xm_gain_recorder = train_utils.LossRecorder() if getattr(args, "xm_best_of_k", 1) > 1 else None
+        
         del train_dataset_group
 
         # function for saving/removing
@@ -2263,6 +2406,11 @@ class NetworkTrainer:
                 loss_recorder.add(epoch=epoch, step=step, loss=current_loss)
                 avr_loss: float = loss_recorder.moving_average
                 logs = {"avr_loss": avr_loss}  # , "lr": lr_scheduler.get_last_lr()[0]}
+
+                if xm_gain_recorder is not None and "xm/gain_pct" in loss_metrics:
+                    xm_gain_recorder.add(epoch=epoch, step=step, loss=loss_metrics["xm/gain_pct"])
+                    logs["xm_gain"] = f"{xm_gain_recorder.moving_average:.1f}%"
+
                 progress_bar.set_postfix(**logs)
 
                 if args.scale_weight_norms:

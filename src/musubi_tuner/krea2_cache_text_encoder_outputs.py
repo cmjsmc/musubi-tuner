@@ -22,13 +22,13 @@ from musubi_tuner.krea2 import krea2_utils
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)
 
 
 def encode_and_save_batch(encoder, batch: list[ItemInfo]):
     prompts = [item.caption for item in batch]
-    for i, item in enumerate(batch):
-        print(f"Item {i}: {item.item_key}, prompt: {item.caption}")
+    # for i, item in enumerate(batch):
+    #     print(f"Item {i}: {item.item_key}, prompt: {item.caption}")
 
     hiddens, mask = krea2_utils.get_krea2_prompt_embeds(encoder, prompts)  # (B, seq, L, D), (B, seq)
 

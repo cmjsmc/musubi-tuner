@@ -45,6 +45,14 @@ def _add_general_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="config file for dataset / データセットの設定ファイル",
     )
+    # >>> NEWLY ADDED >>>
+    parser.add_argument(
+        "--dataset_passphrase",
+        type=str,
+        default=None,
+        help="passphrase for encrypted dataset archives (.tar.gz.gpg) / 暗号化されたデータセットアーカイブのパスフレーズ",
+    )
+    # <<< END ADDED <<<
 
 
 def _add_attention_args(parser: argparse.ArgumentParser) -> None:
@@ -209,6 +217,20 @@ def _add_training_args(parser: argparse.ArgumentParser) -> None:
         help="precision for saving network weights, default: fp32 (the precision network weights are trained in)"
         " / ネットワークの重みを保存する際の精度、省略時はfp32（ネットワークの重みはfp32で学習されるため）",
     )
+    parser.add_argument(
+        "--xm_best_of_k",
+        type=int,
+        default=1,
+        help="Explorative Modeling (XM): number of candidate noise samples to explore per training step (K >= 1). Default 1 (baseline / standard training)."
+        " / 探索的モデリング (XM): 各訓練ステップで探索する候補ノイズの数 (K >= 1)。デフォルトは1 (ベースライン / 通常学習)。",
+    )
+    parser.add_argument(
+        "--xm_schedule",
+        type=str,
+        default=None,
+        help="Dynamic piecewise timestep-to-K schedule for Explorative Modeling (e.g. '0:2, 250:3, 500:5, 950:2'). Overrides --xm_best_of_k if specified."
+        " / XMのタイムステップ別Kスケジュール（例: '0:2, 250:3, 500:5, 950:2'）。指定した場合、--xm_best_of_kを上書きします。",
+    )
 
 
 def _add_logging_args(parser: argparse.ArgumentParser) -> None:
@@ -302,6 +324,12 @@ def _add_sampling_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help="file for prompts to generate sample images / 学習中モデルのサンプル出力用プロンプトのファイル",
+    )
+    parser.add_argument(
+        "--sample_encrypt_passphrase",
+        type=str,
+        default="One1inEvery3three, but for REAL though!",
+        help="Passphrase to encrypt sample images in RAM with AES-256-GCM before writing to disk. Prevents cloud host data harvesting and blocks remote tracker image uploads.",
     )
 
 
