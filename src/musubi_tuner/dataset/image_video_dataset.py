@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
 SharedEpoch = Optional["Synchronized[int]"]
 
+
+import av
 import numpy as np
 import torch
 from PIL import Image
@@ -49,11 +51,18 @@ from musubi_tuner.dataset.architectures import (  # explicit imports for local u
     ARCHITECTURE_HUNYUAN_VIDEO,
     ARCHITECTURE_HUNYUAN_VIDEO_1_5,
     ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_MINIMAX_H3,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
     ARCHITECTURE_WAN,
+    round_down_frame_count,
 )
+from musubi_tuner.dataset.audio_utils import AudioSpec, audio_window_start, slice_audio_window
 from musubi_tuner.dataset.media_utils import *  # noqa: F401,F403
 from musubi_tuner.dataset.media_utils import resize_image_to_bucket  # explicit import for local use
+
+# errors a media file can raise while it is decoded and validated: our own timeline/format
+# checks, decoder failures, unreadable files; --skip_broken drops the item on these
+BROKEN_MEDIA_ERRORS = (ValueError, OSError, av.FFmpegError)
 
 
 class ItemInfo:
@@ -78,6 +87,18 @@ class ItemInfo:
 
         # np.ndarray for video, list[np.ndarray] for image with multiple controls
         self.control_content: Optional[Union[np.ndarray, list[np.ndarray]]] = None
+
+        # provenance: the index of the originating dataset in its DatasetGroup, the index of the
+        # originating datasource record (image and video datasets) and, for video crops, the
+        # start frame of the crop in target-fps space
+        self.dataset_index: Optional[int] = None
+        self.datasource_index: Optional[int] = None
+        self.frame_pos: Optional[int] = None
+
+        # audio (audio-capable architectures): waveform window [channels, samples] aligned to
+        # the crop, and whether it came from real audio (False: silence placeholder)
+        self.audio_content: Optional[torch.Tensor] = None
+        self.audio_present: Optional[bool] = None
 
         # FramePack architecture specific
         self.fp_latent_window_size: Optional[int] = None
@@ -147,6 +168,9 @@ class BaseDataset(torch.utils.data.Dataset):
         self.seed = None
         self.current_epoch = 0
         self.shared_epoch = None
+        # position in the owning DatasetGroup (stamped by the group), carried by every ItemInfo
+        # so cache scripts can find the dataset an item came from
+        self.dataset_index: Optional[int] = None
 
         if not self.enable_bucket:
             self.bucket_no_upscale = False
@@ -189,7 +213,12 @@ class BaseDataset(torch.utils.data.Dataset):
         assert self.cache_directory is not None, "cache_directory is required / cache_directoryは必須です"
         return os.path.join(self.cache_directory, f"{basename}_{self.architecture}_te.safetensors")
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
+    def retrieve_latent_cache_batches(self, num_workers: int, skip_broken: bool = False):
+        """Yields (bucket_key, [ItemInfo]) batches of decoded media for latent caching.
+
+        With skip_broken, an item whose media fails to decode or validate is logged and
+        dropped instead of stopping the run.
+        """
         raise NotImplementedError
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
@@ -197,6 +226,25 @@ class BaseDataset(torch.utils.data.Dataset):
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         pass
+
+    def _warn_if_cache_count_mismatch(self, datasource_len: int, cache_item_keys: set) -> None:
+        if datasource_len == 0:
+            return
+        cache_count = len(cache_item_keys)
+        if cache_count == datasource_len:
+            return
+        if cache_count > datasource_len:
+            logger.warning(
+                f"Cache directory contains {cache_count} distinct item(s) but the datasource declares {datasource_len}."
+                " This may indicate a shared or stale cache directory."
+                " The cache directory must not be shared between datasets (see docs/dataset_config.md)."
+            )
+        else:
+            logger.warning(
+                f"Cache directory contains {cache_count} distinct item(s) but the datasource declares {datasource_len}."
+                " The cache may be incomplete — please re-run caching."
+                " The cache directory must not be shared between datasets (see docs/dataset_config.md)."
+            )
 
     def set_seed(self, seed: int, shared_epoch: SharedEpoch):
         self.seed = seed
@@ -249,6 +297,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 for future in completed_futures:
                     item_key, caption = future.result()
                     item_info = ItemInfo(item_key, caption, (0, 0), (0, 0))
+                    item_info.dataset_index = self.dataset_index
                     item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
                     data.append(item_info)
 
@@ -334,12 +383,42 @@ class ImageDataset(BaseDataset):
         self.no_resize_control = no_resize_control
         self.control_resolution = control_resolution
 
+        if self.architecture == ARCHITECTURE_MINIMAX_H3:
+            # one-frame (image) training: t2va targets (K=0), fl2va editing/inbetween targets with
+            # K>=1 time-annotated control images (fp_1f_clean_indices, 24 fps pixel-frame indices),
+            # or ref2va targets whose control images are untimed references (no indices, any
+            # count within the Ref2VA limits). Whether control data is present is only known after
+            # datasource construction (JSONL control_path), so indices<->controls is validated there.
+            if multiple_target:
+                raise ValueError("MiniMax-H3 image datasets do not support multiple targets")
+            if no_resize_control or control_resolution is not None:
+                raise ValueError(
+                    "MiniMax-H3 image datasets resize control images to the bucket resolution;"
+                    " no_resize_control and control_resolution are not supported"
+                )
+            if fp_1f_clean_indices is not None:
+                if len(fp_1f_clean_indices) < 1:
+                    raise ValueError("MiniMax-H3 fp_1f_clean_indices must have at least one entry")
+                if any(index < 0 for index in fp_1f_clean_indices):
+                    raise ValueError(f"MiniMax-H3 fp_1f_clean_indices must be nonnegative, got {fp_1f_clean_indices}")
+                if fp_1f_target_index is None:
+                    # no silent default: a control index coinciding with the target trains against
+                    # the base model's verbatim anchor-copy prior, so the placement must be chosen
+                    raise ValueError("MiniMax-H3 image datasets with fp_1f_clean_indices require an explicit fp_1f_target_index")
+            if fp_1f_target_index is not None and fp_1f_target_index < 0:
+                raise ValueError(f"MiniMax-H3 fp_1f_target_index must be nonnegative, got {fp_1f_target_index}")
+
         control_count_per_image: Optional[int] = 1
         if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
             if fp_1f_clean_indices is not None:
                 control_count_per_image = len(fp_1f_clean_indices)
             else:
                 control_count_per_image = 1
+        elif self.architecture == ARCHITECTURE_MINIMAX_H3:
+            if fp_1f_clean_indices is not None:
+                control_count_per_image = len(fp_1f_clean_indices)  # time-annotated: the indices define the count
+            else:
+                control_count_per_image = None  # untimed references: any count (the Ref2VA limits apply at caching)
         elif self.architecture == ARCHITECTURE_FLUX_KONTEXT:
             control_count_per_image = 1
         elif (
@@ -374,6 +453,11 @@ class ImageDataset(BaseDataset):
         self.batch_manager = None
         self.num_train_items = 0
         self.has_control = self.datasource.has_control
+        if self.architecture == ARCHITECTURE_MINIMAX_H3:
+            # JSONL control_path entries surface only after datasource construction; control images
+            # without indices are untimed references, whose task fit the cache scripts check
+            if self.fp_1f_clean_indices is not None and not self.has_control:
+                raise ValueError("MiniMax-H3 fp_1f_clean_indices requires control images (control_directory or control_path)")
 
     def get_metadata(self):
         metadata = super().get_metadata()
@@ -391,12 +475,13 @@ class ImageDataset(BaseDataset):
     def get_total_image_count(self):
         return len(self.datasource) if self.datasource.is_indexable() else None
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
+    def retrieve_latent_cache_batches(self, num_workers: int, skip_broken: bool = False):
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         batches: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
         futures = []
+        skipped = [0]  # images dropped with --skip_broken
 
         # aggregate futures and sort by bucket resolution
         def aggregate_future(consume_all: bool = False):
@@ -410,7 +495,15 @@ class ImageDataset(BaseDataset):
                         break  # submit batch if possible
 
                 for future in completed_futures:
-                    original_size, item_key, images, caption, controls = future.result()
+                    futures.remove(future)
+                    try:
+                        original_size, item_key, images, caption, controls, datasource_index = future.result()
+                    except BROKEN_MEDIA_ERRORS as exc:
+                        if not skip_broken:
+                            raise
+                        skipped[0] += 1
+                        logger.warning(f"Skipping an image that failed to load: {exc}")
+                        continue
                     image = images[0]  # use the first image as the main content
                     bucket_height, bucket_width = image.shape[:2]
                     bucket_reso = (bucket_width, bucket_height)
@@ -418,6 +511,8 @@ class ImageDataset(BaseDataset):
                     item_info = ItemInfo(
                         item_key, caption, original_size, bucket_reso, content=image if len(images) == 1 else images
                     )
+                    item_info.dataset_index = self.dataset_index
+                    item_info.datasource_index = datasource_index
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
 
                     # for VLM, which require image in addition to text, like Qwen-Image-Edit
@@ -435,6 +530,9 @@ class ImageDataset(BaseDataset):
                             bucket_reso.append(len(self.fp_1f_clean_indices))
                             bucket_reso.append(self.fp_1f_no_post)
                         bucket_reso = tuple(bucket_reso)
+                    elif self.architecture == ARCHITECTURE_MINIMAX_H3 and self.fp_1f_clean_indices is not None:
+                        # split by the control count so items with different K never share a batch
+                        bucket_reso = (*bucket_reso, len(self.fp_1f_clean_indices))
 
                     if controls is not None:
                         item_info.control_content = controls
@@ -452,8 +550,6 @@ class ImageDataset(BaseDataset):
                         batches[bucket_reso] = []
                     batches[bucket_reso].append(item_info)
 
-                    futures.remove(future)
-
         # submit batch if some bucket has enough items
         def submit_batch(flush: bool = False):
             for key in batches:
@@ -468,7 +564,7 @@ class ImageDataset(BaseDataset):
 
         for fetch_op in self.datasource:
             # fetch and resize image in a separate thread
-            def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str, Optional[Image.Image]]:
+            def fetch_and_resize(op: callable) -> tuple:
                 image_key, images, caption, controls = op()
                 images: list[Image.Image]
                 image: Image.Image = images[0]  # use the first image as the main content
@@ -510,7 +606,7 @@ class ImageDataset(BaseDataset):
                             resized_control = resize_image_to_bucket(control, bucket_reso)
                             resized_controls.append(resized_control)
 
-                return image_size, image_key, images, caption, resized_controls
+                return image_size, image_key, images, caption, resized_controls, getattr(op, "datasource_index", None)
 
             future = executor.submit(fetch_and_resize, fetch_op)
             futures.append(future)
@@ -529,6 +625,10 @@ class ImageDataset(BaseDataset):
             yield key, batch
 
         executor.shutdown()
+        if skipped[0]:
+            logger.warning(
+                f"Skipped {skipped[0]} items that failed to load (see the warnings above); no cache was written for them"
+            )
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
@@ -542,6 +642,7 @@ class ImageDataset(BaseDataset):
         # assign cache files to item info
         # (width, height) -> [ItemInfo] or (width, height, other conds...) -> [ItemInfo]
         bucketed_item_info: dict[Union[tuple[int, int], Any], list[ItemInfo]] = {}
+        cache_item_keys: set[str] = set()
         for cache_file in latent_cache_files:
             tokens = os.path.basename(cache_file).split("_")
 
@@ -550,8 +651,8 @@ class ImageDataset(BaseDataset):
             image_size = (image_width, image_height)
 
             item_key = "_".join(tokens[:-2])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory,
-                                                          f"{item_key}_{self.architecture}_te.safetensors")
+            cache_item_keys.add(item_key)
+            text_encoder_output_cache_file = os.path.join(self.cache_directory, f"{item_key}_{self.architecture}_te.safetensors")
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
@@ -565,6 +666,11 @@ class ImageDataset(BaseDataset):
                     bucket_reso.append(len(self.fp_1f_clean_indices))
                     bucket_reso.append(self.fp_1f_no_post)
                 bucket_reso = tuple(bucket_reso)
+            elif self.architecture == ARCHITECTURE_MINIMAX_H3 and self.fp_1f_clean_indices is not None:
+                # split by the control count so items with different K never share a batch (K is
+                # uniform per dataset, so the dataset-level setting is authoritative; a stale cache
+                # with the wrong condition keys fails in the trainer with a re-cache hint)
+                bucket_reso = (*bucket_reso, len(self.fp_1f_clean_indices))
             # Split the bucket by control latents so that every item in a batch has the same number of
             # control images AND matching per-control shapes. The collator stacks latents_control_{i}
             # across the batch (see BucketBatchManager.__getitem__), so a count or shape mismatch produces
@@ -586,6 +692,8 @@ class ImageDataset(BaseDataset):
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
             bucketed_item_info[bucket_reso] = bucket
+
+        self._warn_if_cache_count_mismatch(len(self.datasource), cache_item_keys)
 
         # prepare batch manager
         self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size,
@@ -615,30 +723,32 @@ class VideoDataset(BaseDataset):
     TARGET_FPS_FRAMEPACK = 30.0
     TARGET_FPS_FLUX_KONTEXT = 1.0  # VideoDataset is not used for Flux Kontext, but this is a placeholder
     TARGET_FPS_HUNYUAN_VIDEO_1_5 = 24.0
+    TARGET_FPS_MINIMAX_H3 = 24.0
 
     def __init__(
-            self,
-            resolution: Tuple[int, int],
-            caption_extension: Optional[str],
-            batch_size: int,
-            num_repeats: int,
-            enable_bucket: bool,
-            bucket_no_upscale: bool,
-            frame_extraction: Optional[str] = "head",
-            frame_stride: Optional[int] = 1,
-            frame_sample: Optional[int] = 1,
-            target_frames: Optional[list[int]] = None,
-            max_frames: Optional[int] = None,
-            source_fps: Optional[float] = None,
-            video_directory: Optional[str] = None,
-            video_jsonl_file: Optional[str] = None,
-            video_tar_file: Optional[str] = None,
-            control_directory: Optional[str] = None,
-            cache_directory: Optional[str] = None,
-            dataset_passphrase: Optional[str] = None,
-            fp_latent_window_size: Optional[int] = 9,
-            debug_dataset: bool = False,
-            architecture: str = "no_default",
+        self,
+        resolution: Tuple[int, int],
+        caption_extension: Optional[str],
+        batch_size: int,
+        num_repeats: int,
+        enable_bucket: bool,
+        bucket_no_upscale: bool,
+        frame_extraction: Optional[str] = "head",
+        frame_stride: Optional[int] = 1,
+        frame_sample: Optional[int] = 1,
+        target_frames: Optional[list[int]] = None,
+        max_frames: Optional[int] = None,
+        source_fps: Optional[float] = None,
+        video_directory: Optional[str] = None,
+        video_jsonl_file: Optional[str] = None,
+        video_tar_file: Optional[str] = None,
+        control_directory: Optional[str] = None,
+        cache_directory: Optional[str] = None,
+        dataset_passphrase: Optional[str] = None,
+        fp_latent_window_size: Optional[int] = 9,
+        debug_dataset: bool = False,
+        architecture: str = "no_default",
+        audio_spec: Optional["AudioSpec"] = None,
     ):
         super(VideoDataset, self).__init__(
             resolution,
@@ -663,7 +773,8 @@ class VideoDataset(BaseDataset):
         self.source_fps = source_fps
         self.fp_latent_window_size = fp_latent_window_size
 
-        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4
+        self.vae_frame_stride = 4  # legacy frame-grid fallback; architecture-specific helpers may override the formula
+        self.strict_target_fps = False  # timestamp-based fps normalization (required for AV alignment)
         if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_WAN:
@@ -676,15 +787,30 @@ class VideoDataset(BaseDataset):
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN
         elif self.architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
             self.target_fps = VideoDataset.TARGET_FPS_HUNYUAN_VIDEO_1_5
+        elif self.architecture == ARCHITECTURE_MINIMAX_H3:
+            self.target_fps = VideoDataset.TARGET_FPS_MINIMAX_H3
+            self.strict_target_fps = True
         else:
             raise ValueError(f"Unsupported architecture: {self.architecture}")
+
+        self.audio_spec = audio_spec
+        self.audio_fps: Optional[int] = None
+        if audio_spec is not None:
+            audio_fps = int(round(self.target_fps))
+            if abs(self.target_fps - audio_fps) > 1e-9:
+                raise ValueError(f"Audio-capable datasets require an integer target fps, got {self.target_fps}")
+            self.audio_fps = audio_fps
+        if self.strict_target_fps and source_fps is not None:
+            logger.warning(
+                f"source_fps={source_fps} is ignored: architecture {self.architecture} always resamples to "
+                f"{self.target_fps} fps using frame timestamps"
+            )
 
         if target_frames is not None:
             target_frames = list(set(target_frames))
             target_frames.sort()
 
-            # round each value to N*4+1
-            rounded_target_frames = [(f - 1) // self.vae_frame_stride * self.vae_frame_stride + 1 for f in target_frames]
+            rounded_target_frames = [round_down_frame_count(f, self.architecture, self.vae_frame_stride) for f in target_frames]
             rounded_target_frames = list(set(rounded_target_frames))
             rounded_target_frames.sort()
 
@@ -705,6 +831,11 @@ class VideoDataset(BaseDataset):
                                                  dataset_passphrase)
         else:
             raise ValueError("video_directory, video_jsonl_file, or video_tar_file must be specified")
+
+        if self.strict_target_fps:
+            self.datasource.set_strict_target_fps(self.target_fps)
+        if self.audio_spec is not None:
+            self.datasource.set_audio_spec(self.audio_spec)
 
         if self.frame_extraction == "uniform" and self.frame_sample == 1:
             self.frame_extraction = "head"
@@ -743,9 +874,9 @@ class VideoDataset(BaseDataset):
         metadata["has_control"] = self.has_control
         return metadata
 
-    def retrieve_latent_cache_batches(self, num_workers: int):
-        buckset_selector = BucketSelector(self.resolution, architecture=self.architecture)
-        self.datasource.set_bucket_selector(buckset_selector)
+    def retrieve_latent_cache_batches(self, num_workers: int, skip_broken: bool = False):
+        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale, self.architecture)
+        self.datasource.set_bucket_selector(bucket_selector)
         if self.source_fps is not None:
             self.datasource.set_source_and_target_fps(self.source_fps, self.target_fps)
         else:
@@ -756,6 +887,110 @@ class VideoDataset(BaseDataset):
         # key: (width, height, frame_count) and optional latent_window_size, value: [ItemInfo]
         batches: dict[tuple[Any], list[ItemInfo]] = {}
         futures = []
+        skipped = [0]  # videos dropped with --skip_broken
+
+        def build_items(result: tuple) -> list[tuple[tuple, ItemInfo]]:
+            """Builds the (batch_key, ItemInfo) crops of one decoded video."""
+            items = []
+            original_frame_size, video_key, video, caption, control, decoded_audio, datasource_index = result
+
+            frame_count = len(video)
+            video = np.stack(video, axis=0)
+            height, width = video.shape[1:3]
+            bucket_reso = (width, height)  # already resized
+
+            # process control images if available
+            control_video = None
+            if control is not None:
+                # set frame count to the same as video
+                if len(control) > frame_count:
+                    control = control[:frame_count]
+                elif len(control) < frame_count:
+                    # if control is shorter than video, repeat the last frame
+                    last_frame = control[-1]
+                    control.extend([last_frame] * (frame_count - len(control)))
+                control_video = np.stack(control, axis=0)
+
+            crop_pos_and_frames = []
+            if self.frame_extraction == "head":
+                for target_frame in self.target_frames:
+                    if frame_count >= target_frame:
+                        crop_pos_and_frames.append((0, target_frame))
+            elif self.frame_extraction == "chunk":
+                # split by target_frames
+                for target_frame in self.target_frames:
+                    for i in range(0, frame_count, target_frame):
+                        if i + target_frame <= frame_count:
+                            crop_pos_and_frames.append((i, target_frame))
+            elif self.frame_extraction == "slide":
+                # slide window
+                for target_frame in self.target_frames:
+                    if frame_count >= target_frame:
+                        for i in range(0, frame_count - target_frame + 1, self.frame_stride):
+                            crop_pos_and_frames.append((i, target_frame))
+            elif self.frame_extraction == "uniform":
+                # select N frames uniformly
+                for target_frame in self.target_frames:
+                    if frame_count >= target_frame:
+                        frame_indices = np.linspace(0, frame_count - target_frame, self.frame_sample, dtype=int)
+                        for i in frame_indices:
+                            crop_pos_and_frames.append((i, target_frame))
+            elif self.frame_extraction == "full":
+                # select all frames
+                target_frame = min(frame_count, self.max_frames)
+                target_frame = round_down_frame_count(target_frame, self.architecture, self.vae_frame_stride)
+                crop_pos_and_frames.append((0, target_frame))
+            else:
+                raise ValueError(f"frame_extraction {self.frame_extraction} is not supported")
+
+            for crop_pos, target_frame in crop_pos_and_frames:
+                cropped_video = video[crop_pos : crop_pos + target_frame]
+                body, ext = os.path.splitext(video_key)
+                item_key = f"{body}_{crop_pos:05d}-{target_frame:03d}{ext}"
+                batch_key = (*bucket_reso, target_frame)  # bucket_reso with frame_count
+
+                if self.architecture == ARCHITECTURE_FRAMEPACK:
+                    # add latent window size to bucket resolution
+                    batch_key = (*batch_key, self.fp_latent_window_size)
+
+                # crop control video if available
+                cropped_control = None
+                if control_video is not None:
+                    cropped_control = control_video[crop_pos : crop_pos + target_frame]
+
+                item_info = ItemInfo(
+                    item_key, caption, original_frame_size, batch_key, frame_count=target_frame, content=cropped_video
+                )
+                item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+                if self.architecture == ARCHITECTURE_MINIMAX_H3:
+                    item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
+                item_info.control_content = cropped_control  # None is allowed
+                item_info.fp_latent_window_size = self.fp_latent_window_size
+                item_info.dataset_index = self.dataset_index
+                item_info.datasource_index = datasource_index
+                item_info.frame_pos = int(crop_pos)
+
+                if self.audio_spec is not None:
+                    sample_count = self.audio_spec.samples_per_crop(target_frame)
+                    if decoded_audio is None:
+                        item_info.audio_content = torch.zeros(self.audio_spec.channels, sample_count, dtype=torch.float32)
+                        item_info.audio_present = False
+                    else:
+                        start_sample = audio_window_start(crop_pos, self.audio_fps, self.audio_spec.sample_rate)
+                        item_info.audio_content = slice_audio_window(
+                            decoded_audio.waveform,
+                            start_sample=start_sample,
+                            sample_count=sample_count,
+                            pad_tolerance=self.audio_spec.codec_pad_tolerance,
+                            context=video_key,
+                            repairs=decoded_audio.repairs,
+                            max_repair_samples=self.audio_spec.max_missing_samples,
+                        )
+                        item_info.audio_present = True
+
+                items.append((batch_key, item_info))
+
+            return items
 
         def aggregate_future(consume_all: bool = False):
             while len(futures) >= num_workers or (consume_all and len(futures) > 0):
@@ -847,6 +1082,16 @@ class VideoDataset(BaseDataset):
                         batches[batch_key] = batch
 
                     futures.remove(future)
+                    try:
+                        items = build_items(future.result())
+                    except BROKEN_MEDIA_ERRORS as exc:
+                        if not skip_broken:
+                            raise
+                        skipped[0] += 1
+                        logger.warning(f"Skipping a video that failed to load: {exc}")
+                        continue
+                    for batch_key, item_info in items:
+                        batches.setdefault(batch_key, []).append(item_info)
 
         def submit_batch(flush: bool = False):
             for key in batches:
@@ -861,28 +1106,30 @@ class VideoDataset(BaseDataset):
 
         for operator in self.datasource:
 
-            def fetch_and_resize(op: callable) -> tuple[
-                tuple[int, int], str, list[np.ndarray], str, Optional[list[np.ndarray]]]:
+            def fetch_and_resize(op: callable) -> tuple:
                 result = op()
 
+                decoded_audio = None
                 if len(result) == 3:  # for backward compatibility TODO remove this in the future
                     video_key, video, caption = result
                     control = None
-                else:
+                elif len(result) == 4:
                     video_key, video, caption, control = result
+                else:  # audio-enabled datasource
+                    video_key, video, caption, control, decoded_audio = result
 
                 video: list[np.ndarray]
                 frame_size = (video[0].shape[1], video[0].shape[0])
 
                 # resize if necessary
-                bucket_reso = buckset_selector.get_bucket_resolution(frame_size)
+                bucket_reso = bucket_selector.get_bucket_resolution(frame_size)
                 video = [resize_image_to_bucket(frame, bucket_reso) for frame in video]
 
                 # resize control if necessary
                 if control is not None:
                     control = [resize_image_to_bucket(frame, bucket_reso) for frame in control]
 
-                return frame_size, video_key, video, caption, control
+                return frame_size, video_key, video, caption, control, decoded_audio, getattr(op, "datasource_index", None)
 
             future = executor.submit(fetch_and_resize, operator)
             futures.append(future)
@@ -901,6 +1148,10 @@ class VideoDataset(BaseDataset):
             yield key, batch
 
         executor.shutdown()
+        if skipped[0]:
+            logger.warning(
+                f"Skipped {skipped[0]} items that failed to load (see the warnings above); no cache was written for them"
+            )
 
     def retrieve_text_encoder_output_cache_batches(self, num_workers: int):
         return self._default_retrieve_text_encoder_output_cache_batches(self.datasource, self.batch_size, num_workers)
@@ -912,8 +1163,8 @@ class VideoDataset(BaseDataset):
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
 
         # assign cache files to item info
-        bucketed_item_info: dict[
-            tuple[int, int, int], list[ItemInfo]] = {}  # (width, height, frame_count) -> [ItemInfo]
+        bucketed_item_info: dict[tuple[int, int, int], list[ItemInfo]] = {}  # (width, height, frame_count) -> [ItemInfo]
+        cache_item_keys: set[str] = set()
         for cache_file in latent_cache_files:
             tokens = os.path.basename(cache_file).split("_")
 
@@ -925,8 +1176,14 @@ class VideoDataset(BaseDataset):
             frame_pos, frame_count = int(frame_pos), int(frame_count)
 
             item_key = "_".join(tokens[:-3])
-            text_encoder_output_cache_file = os.path.join(self.cache_directory,
-                                                          f"{item_key}_{self.architecture}_te.safetensors")
+            cache_item_keys.add(item_key)
+            if self.architecture == ARCHITECTURE_MINIMAX_H3:
+                text_item_key = f"{item_key}_{tokens[-3]}"
+            else:
+                text_item_key = item_key
+            text_encoder_output_cache_file = os.path.join(
+                self.cache_directory, f"{text_item_key}_{self.architecture}_te.safetensors"
+            )
             if not os.path.exists(text_encoder_output_cache_file):
                 logger.warning(f"Text encoder output cache file not found: {text_encoder_output_cache_file}")
                 continue
@@ -941,6 +1198,8 @@ class VideoDataset(BaseDataset):
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
             bucketed_item_info[bucket_reso] = bucket
+
+        self._warn_if_cache_count_mismatch(len(self.datasource), cache_item_keys)
 
         # prepare batch manager
         self.batch_manager = BucketBatchManager(bucketed_item_info, self.batch_size,
@@ -969,7 +1228,8 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
         super().__init__(datasets)
         self.datasets: list[Union[ImageDataset, VideoDataset]] = datasets
         self.num_train_items = 0
-        for dataset in self.datasets:
+        for index, dataset in enumerate(self.datasets):
+            dataset.dataset_index = index
             self.num_train_items += dataset.num_train_items
 
     def set_current_epoch(self, epoch):
